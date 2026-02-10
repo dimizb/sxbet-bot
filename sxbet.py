@@ -272,7 +272,7 @@ class SXBetClient:
 #  DETECCIÓN DE SUREBETS
 # ─────────────────────────────────────────────────────────────
 
-def find_surebets(groups: list, markets: dict, orders: dict) -> list:
+def find_surebets(groups: list, markets: dict, orders: dict, min_roi: float = 0.0) -> list:
     """
     Para cada apuesta activa calcula si hay surebet disponible.
     Devuelve lista ordenada por ROI descendente.
@@ -301,6 +301,8 @@ def find_surebets(groups: list, markets: dict, orders: dict) -> list:
 
         if guaranteed <= 0:
             continue  # no es surebet real
+        if roi < min_roi:
+            continue  # por debajo del ROI mínimo configurado
 
         live_same = _best_taker_odds(mkt_orders, g["betting_outcome_one"])
 
@@ -309,6 +311,7 @@ def find_surebets(groups: list, markets: dict, orders: dict) -> list:
 
         surebets.append({
             "stable_key":        g["stable_key"],
+            "market_hash":       g["market_hash"],
             "event":             f"{mkt.get('teamOneName','?')} vs {mkt.get('teamTwoName','?')}",
             "sport":             mkt.get("sportLabel", "?"),
             "league":            mkt.get("leagueLabel", "?"),

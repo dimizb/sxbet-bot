@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 load_dotenv()  # carga variables desde .env si existe
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 VERSION_DATE = "2026-02-10"
 VERSION_NOTES = [
     "✅ Detección de surebets en apuestas activas",
@@ -20,6 +20,9 @@ VERSION_NOTES = [
     "✅ Detección automática de rate limit 429",
     "✅ Comandos: /surebets /activas /stats /historial /estado /version",
     "✅ Soporte para múltiples Chat IDs (TELEGRAM_CHAT_ID separados por coma)",
+    "✅ Detección de partidos en LIVE con marcador en /activas",
+    "✅ /setroi — ROI mínimo configurable desde Telegram",
+    "✅ MIN_ROI como variable de entorno (default 1%)",
 ]
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -52,6 +55,7 @@ SX_WALLET        = os.environ["SX_WALLET"]
 # - TRADES_INTERVAL: cada cuántos segundos refresca trades y mercados (más pesado)
 ORDERS_INTERVAL = int(os.getenv("ORDERS_INTERVAL", "10"))   # default 10s
 TRADES_INTERVAL = int(os.getenv("TRADES_INTERVAL", "60"))   # default 60s
+MIN_ROI         = float(os.getenv("MIN_ROI", "1.0"))        # % ROI mínimo para alertar
 
 client = SXBetClient(api_key=SX_API_KEY, wallet=SX_WALLET)
 
@@ -91,6 +95,32 @@ def roi_emoji(roi: float) -> str:
 #  COMANDOS
 # ─────────────────────────────────────────────────────────────
 
+async def cmd_setroi(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Cambia el ROI mínimo en caliente sin tocar Railway."""
+    if not auth(update): return
+    global MIN_ROI
+    args = ctx.args
+    if not args:
+        await update.message.reply_text(
+            f"📊 ROI mínimo actual: *`{MIN_ROI:.1f}%`*\n\n"
+            "Para cambiarlo: `/setroi 3\\.5`",
+            parse_mode=ParseMode.MARKDOWN_V2
+        )
+        return
+    try:
+        new_val = float(args[0].replace(",", "."))
+        if new_val < 0 or new_val > 50:
+            raise ValueError
+        MIN_ROI = new_val
+        await update.message.reply_text(
+            f"✅ ROI mínimo actualizado a *`{MIN_ROI:.1f}%`*\n"
+            f"Solo recibirás alertas de surebets con ROI ≥ `{MIN_ROI:.1f}%`",
+            parse_mode=ParseMode.MARKDOWN_V2
+        )
+    except (ValueError, IndexError):
+        await update.message.reply_text("❌ Valor inválido\\. Usa por ejemplo: `/setroi 2\\.5`", parse_mode=ParseMode.MARKDOWN_V2)
+
+
 async def cmd_version(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not auth(update): return
     notes = "\n".join(f"  {_escape(n)}" for n in VERSION_NOTES)
@@ -117,6 +147,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "🔕 /monitor\\_off — Desactivar alertas\n"
         "ℹ️ /estado — Estado del monitor\n"
         "🔢 /version — Versión del bot\n"
+        "📊 /setroi — Ver o cambiar ROI mínimo\n"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2)
 
@@ -204,6 +235,7 @@ async def cmd_estado(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"*Estado del Monitor*\n\n"
         f"{'🟢 Activo' if activo else '🔴 Inactivo'}\n"
         f"Intervalo órdenes: `{ORDERS_INTERVAL}s` | Trades: `{TRADES_INTERVAL}s`\n"
+        f"ROI mínimo: `{MIN_ROI:.1f}%`\n"
         f"Último escaneo: `{last}`\n"
         f"Surebets encontradas: `{found}`\n"
         f"Escaneos totales: `{scans}`\n"
@@ -302,7 +334,7 @@ def _fetch_surebets_raw() -> list:
         return []
     hashes = list({g["market_hash"] for g in groups})
     orders = client.fetch_orders(hashes)  # única llamada "live"
-    return find_surebets(groups, markets, orders)
+    return find_surebets(groups, markets, orders, min_roi=MIN_ROI)
 
 
 def _scan_surebets() -> str:
@@ -311,7 +343,13 @@ def _scan_surebets() -> str:
         return "🔍 *Escaneo completado*\n\nNo hay surebets disponibles ahora mismo\\."
 
     lines = [f"🎯 *{len(surebets)} SUREBET{'S' if len(surebets)>1 else ''} DISPONIBLE{'S' if len(surebets)>1 else ''}*\n"]
-    for i, sb in enumerate(surebets, 1):
+    for sb in surebets:
+        # Indicar si el partido está en live
+        mkt = _cache["markets"].get(sb.get("market_hash", ""), {})
+        from time import time as _now2
+        game_time = mkt.get("gameTime", 0) or 0
+        is_live = (game_time > 0 and game_time <= _now2()) or mkt.get("liveEnabled", False)
+        sb["is_live"] = is_live
         lines.append(_format_surebet_alert(sb, compact=True))
     return "\n".join(lines)
 
@@ -424,15 +462,20 @@ def _format_surebet_alert(sb: dict, compact: bool = False) -> str:
     league = sb["league"]
     roi_e  = roi_emoji(roi)
 
+    is_live   = sb.get("is_live", False)
+    live_badge = "🔴 LIVE — " if is_live else ""
+
     if compact:
         return (
-            f"{roi_e} *{_escape(event)}*\n"
+            f"{roi_e} {live_badge}*{_escape(event)}*\n"
             f"   {_escape(side)} @ `{odd_orig:.3f}` → cubrir `{hedge:.2f}` USDC @ `{odd_opp:.3f}`\n"
             f"   💰 Beneficio garantizado: *`{profit:+.2f}` USDC* \\({roi:+.1f}%\\)\n"
         )
 
+    live_line = "🔴 *PARTIDO EN LIVE*\n" if is_live else ""
     return (
         f"🎯 *¡SUREBET DETECTADA\\!*\n\n"
+        f"{live_line}"
         f"🏆 {_escape(sport)} — {_escape(league)}\n"
         f"⚽ {_escape(event)}\n\n"
         f"📌 *Tu apuesta:* {_escape(side)}\n"
@@ -466,6 +509,7 @@ def main():
     app.add_handler(CommandHandler("monitor_off", cmd_monitor_off))
     app.add_handler(CommandHandler("estado",      cmd_estado))
     app.add_handler(CommandHandler("version",     cmd_version))
+    app.add_handler(CommandHandler("setroi",      cmd_setroi))
     app.add_handler(CallbackQueryHandler(callback_handler))
 
     log.info("Bot iniciado ✅")
