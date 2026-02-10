@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 load_dotenv()  # carga variables desde .env si existe
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 VERSION_DATE = "2026-02-10"
 VERSION_NOTES = [
     "✅ Detección de surebets en apuestas activas",
@@ -19,6 +19,7 @@ VERSION_NOTES = [
     "✅ Caché inteligente: órdenes cada Xs, trades cada 60s",
     "✅ Detección automática de rate limit 429",
     "✅ Comandos: /surebets /activas /stats /historial /estado /version",
+    "✅ Soporte para múltiples Chat IDs (TELEGRAM_CHAT_ID separados por coma)",
 ]
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -41,7 +42,8 @@ log = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────
 
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
-ALLOWED_CHAT     = int(os.environ["TELEGRAM_CHAT_ID"])
+# Acepta uno o varios Chat IDs separados por coma: "123456,789012"
+ALLOWED_CHATS = set(int(x.strip()) for x in os.environ["TELEGRAM_CHAT_ID"].split(","))
 SX_API_KEY       = os.environ["SX_API_KEY"]
 SX_WALLET        = os.environ["SX_WALLET"]
 
@@ -65,8 +67,8 @@ _cache = {
 # ─────────────────────────────────────────────────────────────
 
 def auth(update: Update) -> bool:
-    """Rechaza cualquier chat que no sea el tuyo."""
-    return update.effective_chat.id == ALLOWED_CHAT
+    """Rechaza cualquier chat que no esté en la lista."""
+    return update.effective_chat.id in ALLOWED_CHATS
 
 def fmt_ts(ts) -> str:
     if not ts:
@@ -170,7 +172,7 @@ async def cmd_monitor_on(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         interval=ORDERS_INTERVAL,
         first=5,
         name="surebet_monitor",
-        chat_id=ALLOWED_CHAT
+        chat_id=next(iter(ALLOWED_CHATS))  # job usa el primero; notifica a todos abajo
     )
     # Pre-cargar trades en segundo plano
     await asyncio.to_thread(_refresh_trades_cache)
@@ -237,12 +239,13 @@ async def _monitor_job(ctx: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("📊 Ver todas", callback_data="cmd_surebets"),
                 InlineKeyboardButton("📋 Activas",   callback_data="cmd_activas"),
             ]])
-            await ctx.bot.send_message(
-                chat_id=ALLOWED_CHAT,
+            for _cid in ALLOWED_CHATS:
+              await ctx.bot.send_message(
+                chat_id=_cid,
                 text=text,
                 parse_mode=ParseMode.MARKDOWN_V2,
                 reply_markup=keyboard
-            )
+              )
 
         # Limpiar notificaciones de surebets que ya no existen
         current_keys = {sb["stable_key"] for sb in surebets}
