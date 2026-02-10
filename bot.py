@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 load_dotenv()  # carga variables desde .env si existe
 
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 VERSION_DATE = "2026-02-10"
 VERSION_NOTES = [
     "✅ Detección de surebets en apuestas activas",
@@ -23,6 +23,7 @@ VERSION_NOTES = [
     "✅ Detección de partidos en LIVE con marcador en /activas",
     "✅ /setroi — ROI mínimo configurable desde Telegram",
     "✅ MIN_ROI como variable de entorno (default 1%)",
+    "✅ Fix: /activas ahora detecta correctamente partidos en LIVE",
 ]
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -55,7 +56,7 @@ SX_WALLET        = os.environ["SX_WALLET"]
 # - TRADES_INTERVAL: cada cuántos segundos refresca trades y mercados (más pesado)
 ORDERS_INTERVAL = int(os.getenv("ORDERS_INTERVAL", "10"))   # default 10s
 TRADES_INTERVAL = int(os.getenv("TRADES_INTERVAL", "60"))   # default 60s
-MIN_ROI         = float(os.getenv("MIN_ROI", "1.0"))        # % ROI mínimo para alertar
+MIN_ROI         = float(os.getenv("MIN_ROI", "1.0").replace(",", "."))  # % ROI mínimo para alertar
 
 client = SXBetClient(api_key=SX_API_KEY, wallet=SX_WALLET)
 
@@ -363,18 +364,69 @@ def _get_activas() -> str:
     hashes  = list({g["market_hash"] for g in groups})
     markets = client.fetch_markets(hashes)
 
-    lines = [f"📋 *{len(groups)} apuesta{'s' if len(groups)>1 else ''} activa{'s' if len(groups)>1 else ''}*\n"]
-    for g in sorted(groups, key=lambda x: x.get("bet_time", 0), reverse=True):
-        mkt    = markets.get(g["market_hash"], {})
+    import time as _t
+    now = _t.time()
+
+    live_bets    = []
+    pending_bets = []
+
+    for g in groups:
+        mkt       = markets.get(g["market_hash"], {})
+        game_time = mkt.get("gameTime", 0) or 0
+        live_en   = bool(mkt.get("liveEnabled", False))
+        score1    = mkt.get("teamOneScore")
+        score2    = mkt.get("teamTwoScore")
+        is_live   = live_en or (0 < game_time <= now)
+
         evento = f"{mkt.get('teamOneName','?')} vs {mkt.get('teamTwoName','?')}"
         side   = mkt.get("outcomeOneName","O1") if g["betting_outcome_one"] else mkt.get("outcomeTwoName","O2")
         sport  = mkt.get("sportLabel", "?")
-        lines.append(
-            f"• {_escape(sport)} \\| {_escape(evento)}\n"
-            f"  {_escape(side)} @ `{g['avg_odds']:.3f}` — Stake: `{g['total_stake']:.2f}` USDC\n"
-        )
-    return "\n".join(lines)
+        league = mkt.get("leagueLabel", "?")
 
+        score_str = ""
+        if is_live and score1 is not None and score2 is not None:
+            score_str = f" \\(`{score1}\\-{score2}`\\)"
+
+        entry = {
+            "sport": sport, "league": league, "evento": evento,
+            "side": side, "g": g, "is_live": is_live,
+            "score_str": score_str, "game_time": game_time,
+        }
+        if is_live:
+            live_bets.append(entry)
+        else:
+            pending_bets.append(entry)
+
+    lines = [f"📋 *{len(groups)} apuesta{'s' if len(groups)>1 else ''} activa{'s' if len(groups)>1 else ''}*\n"]
+
+    if live_bets:
+        lines.append(f"🔴 *EN LIVE \\({len(live_bets)}\\)*")
+        for e in sorted(live_bets, key=lambda x: x["game_time"]):
+            g = e["g"]
+            lines.append(
+                f"🔴 *{_escape(e['evento'])}*{e['score_str']}\n"
+                f"   {_escape(e['sport'])} — {_escape(e['league'])}\n"
+                f"   {_escape(e['side'])} @ `{g['avg_odds']:.3f}` — Stake: `{g['total_stake']:.2f}` USDC\n"
+                f"   Retorno potencial: `{g['potential_win']:.2f}` USDC"
+            )
+
+    if pending_bets:
+        if live_bets:
+            lines.append("")
+        lines.append(f"⏳ *PENDIENTES \\({len(pending_bets)}\\)*")
+        for e in sorted(pending_bets, key=lambda x: x["game_time"]):
+            g = e["g"]
+            gt    = e["game_time"]
+            from datetime import datetime, timezone as tz
+            fecha = datetime.fromtimestamp(gt, tz=tz.utc).strftime("%d/%m %H:%M") if gt else "?"
+            lines.append(
+                f"⏳ {_escape(e['evento'])}\n"
+                f"   {_escape(e['sport'])} — {_escape(e['league'])}\n"
+                f"   {_escape(e['side'])} @ `{g['avg_odds']:.3f}` — Stake: `{g['total_stake']:.2f}` USDC\n"
+                f"   Partido: `{_escape(fecha)} UTC`"
+            )
+
+    return "\n".join(lines)
 
 def _get_stats() -> str:
     trades = client.fetch_all_trades()
@@ -493,6 +545,36 @@ def _format_surebet_alert(sb: dict, compact: bool = False) -> str:
 #  MAIN
 # ─────────────────────────────────────────────────────────────
 
+async def cmd_debuglive(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Muestra los campos live de todos los mercados activos para diagnóstico."""
+    if not auth(update): return
+    msg = await update.message.reply_text("🔍 Inspeccionando mercados...")
+    try:
+        trades  = client.fetch_all_trades(settled=False)
+        groups  = client.group_trades(trades)
+        hashes  = list({g["market_hash"] for g in groups})
+        markets = client.fetch_markets(hashes)
+        import time as _t
+        now = _t.time()
+        lines = ["🔍 *Debug campos LIVE*\n"]
+        for mh, mkt in markets.items():
+            gt      = mkt.get("gameTime", 0) or 0
+            live_en = mkt.get("liveEnabled", False)
+            s1      = mkt.get("teamOneScore", "?")
+            s2      = mkt.get("teamTwoScore", "?")
+            is_live = live_en or (0 < gt <= now)
+            evento  = f"{mkt.get('teamOneName','?')} vs {mkt.get('teamTwoName','?')}"
+            from datetime import datetime, timezone as tz
+            gt_str  = datetime.fromtimestamp(gt, tz=tz.utc).strftime("%d/%m %H:%M") if gt else "0"
+            lines.append(
+                f"{'🔴' if is_live else '⏳'} {_escape(evento)}\n"
+                f"   gameTime: `{_escape(gt_str)}` liveEnabled: `{live_en}` score: `{s1}-{s2}`"
+            )
+        await msg.edit_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2)
+    except Exception as e:
+        await msg.edit_text(f"❌ Error: {_escape(str(e))}", parse_mode=ParseMode.MARKDOWN_V2)
+
+
 def main():
     app = (
         Application.builder()
@@ -510,6 +592,7 @@ def main():
     app.add_handler(CommandHandler("estado",      cmd_estado))
     app.add_handler(CommandHandler("version",     cmd_version))
     app.add_handler(CommandHandler("setroi",      cmd_setroi))
+    app.add_handler(CommandHandler("debuglive",   cmd_debuglive))
     app.add_handler(CallbackQueryHandler(callback_handler))
 
     log.info("Bot iniciado ✅")
