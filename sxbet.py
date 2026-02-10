@@ -41,6 +41,41 @@ class SXBetClient:
             "X-Api-Key":    api_key,
             "Content-Type": "application/json",
         })
+        self._rate_limited_until = 0.0  # timestamp hasta el que no pedir
+
+    def _get(self, url: str, params: dict = None, timeout: int = 15) -> dict | None:
+        """
+        GET con detección automática de rate limit (HTTP 429).
+        Si hay 429, espera el tiempo indicado en el header Retry-After
+        y devuelve None para que el llamador use el caché anterior.
+        """
+        import time as _time
+
+        now = _time.time()
+        if now < self._rate_limited_until:
+            wait = self._rate_limited_until - now
+            log.warning(f"Rate limit activo, esperando {wait:.1f}s más")
+            return None
+
+        try:
+            r = self.session.get(url, params=params, timeout=timeout)
+
+            if r.status_code == 429:
+                # Leer cuánto hay que esperar
+                retry_after = int(r.headers.get("Retry-After", 30))
+                self._rate_limited_until = _time.time() + retry_after
+                log.warning(
+                    f"⚠️ RATE LIMIT 429 en {url} — "
+                    f"esperando {retry_after}s (hasta {retry_after}s desde ahora)"
+                )
+                return None
+
+            body = r.json()
+            return body
+
+        except Exception as e:
+            log.error(f"Error GET {url}: {e}")
+            return None
 
     # ── Trades ──────────────────────────────────────────────
 
@@ -69,11 +104,13 @@ class SXBetClient:
                 params["paginationKey"] = next_key
 
             try:
-                r = self.session.get(f"{API_BASE}/trades", params=params, timeout=15)
-                body = r.json()
+                body = self._get(f"{API_BASE}/trades", params=params)
+                if body is None:
+                    break  # rate limited, usar datos parciales
             except Exception as e:
                 log.error(f"fetch_all_trades error: {e}")
                 break
+
 
             if body.get("status") != "success":
                 log.error(f"API /trades error: {body}")
@@ -99,13 +136,11 @@ class SXBetClient:
         for i in range(0, len(unique), 30):
             batch = unique[i:i+30]
             try:
-                r = self.session.get(
+                body = self._get(
                     f"{API_BASE}/markets/find",
-                    params={"marketHashes": ",".join(batch)},
-                    timeout=15
+                    params={"marketHashes": ",".join(batch)}
                 )
-                body = r.json()
-                if body.get("status") == "success":
+                if body and body.get("status") == "success":
                     for m in (body.get("data") or []):
                         result[m["marketHash"]] = m
             except Exception as e:
@@ -126,13 +161,11 @@ class SXBetClient:
         for i in range(0, len(unique), 30):
             batch = unique[i:i+30]
             try:
-                r = self.session.get(
+                body = self._get(
                     f"{API_BASE}/orders",
-                    params={"marketHashes": ",".join(batch)},
-                    timeout=15
+                    params={"marketHashes": ",".join(batch)}
                 )
-                body = r.json()
-                if body.get("status") != "success":
+                if not body or body.get("status") != "success":
                     continue
 
                 data = body.get("data", [])

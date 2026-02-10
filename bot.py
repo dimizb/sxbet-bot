@@ -30,13 +30,25 @@ log = logging.getLogger(__name__)
 #  CONFIG  (lee variables de entorno o .env)
 # ─────────────────────────────────────────────────────────────
 
-TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-ALLOWED_CHAT   = int(os.environ["TELEGRAM_CHAT_ID"])   # Solo responde a tu chat
-SX_API_KEY     = os.environ["SX_API_KEY"]
-SX_WALLET      = os.environ["SX_WALLET"]
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))   # segundos entre escaneos
+TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
+ALLOWED_CHAT     = int(os.environ["TELEGRAM_CHAT_ID"])
+SX_API_KEY       = os.environ["SX_API_KEY"]
+SX_WALLET        = os.environ["SX_WALLET"]
+
+# Intervalos de escaneo independientes:
+# - ORDERS_INTERVAL: cada cuántos segundos pide las cuotas live (puede ser 5s)
+# - TRADES_INTERVAL: cada cuántos segundos refresca trades y mercados (más pesado)
+ORDERS_INTERVAL = int(os.getenv("ORDERS_INTERVAL", "10"))   # default 10s
+TRADES_INTERVAL = int(os.getenv("TRADES_INTERVAL", "60"))   # default 60s
 
 client = SXBetClient(api_key=SX_API_KEY, wallet=SX_WALLET)
+
+# ── Cache en memoria ──────────────────────────────────────────
+_cache = {
+    "groups":   [],      # apuestas activas agrupadas
+    "markets":  {},      # datos de mercado
+    "last_trades_fetch": 0,
+}
 
 # ─────────────────────────────────────────────────────────────
 #  HELPERS
@@ -131,13 +143,15 @@ async def cmd_monitor_on(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     ctx.job_queue.run_repeating(
         _monitor_job,
-        interval=CHECK_INTERVAL,
+        interval=ORDERS_INTERVAL,
         first=5,
         name="surebet_monitor",
         chat_id=ALLOWED_CHAT
     )
+    # Pre-cargar trades en segundo plano
+    await asyncio.to_thread(_refresh_trades_cache)
     await update.message.reply_text(
-        f"🔔 Monitor activado\\. Escaneo cada *{CHECK_INTERVAL}s*",
+        f"🔔 Monitor activado\\. Órdenes cada *{ORDERS_INTERVAL}s*, trades cada *{TRADES_INTERVAL}s*",
         parse_mode=ParseMode.MARKDOWN_V2
     )
 
@@ -163,7 +177,7 @@ async def cmd_estado(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = (
         f"*Estado del Monitor*\n\n"
         f"{'🟢 Activo' if activo else '🔴 Inactivo'}\n"
-        f"Intervalo: `{CHECK_INTERVAL}s`\n"
+        f"Intervalo órdenes: `{ORDERS_INTERVAL}s` | Trades: `{TRADES_INTERVAL}s`\n"
         f"Último escaneo: `{last}`\n"
         f"Surebets encontradas: `{found}`\n"
         f"Escaneos totales: `{scans}`\n"
@@ -231,15 +245,36 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 #  FUNCIONES SÍNCRONAS (se ejecutan en thread pool)
 # ─────────────────────────────────────────────────────────────
 
-def _fetch_surebets_raw() -> list:
-    """Devuelve lista de surebets activas con todos los datos."""
-    trades  = client.fetch_all_trades(settled=False)
-    if not trades:
-        return []
+def _refresh_trades_cache():
+    """Actualiza el caché de trades y mercados (operación pesada, hacerla poco frecuente)."""
+    import time as _time
+    now = _time.time()
+    if now - _cache["last_trades_fetch"] < TRADES_INTERVAL:
+        return  # aún en caché
+    trades = client.fetch_all_trades(settled=False)
+    if trades is None:
+        return  # error de red, mantener caché anterior
     groups  = client.group_trades(trades)
     hashes  = list({g["market_hash"] for g in groups})
     markets = client.fetch_markets(hashes)
-    orders  = client.fetch_orders(hashes)
+    _cache["groups"]  = groups
+    _cache["markets"] = markets
+    _cache["last_trades_fetch"] = now
+    log.info(f"Cache trades actualizado: {len(groups)} apuestas activas")
+
+
+def _fetch_surebets_raw() -> list:
+    """
+    Operación rápida: usa el caché de trades/mercados
+    y solo pide las órdenes (cambian cada segundo).
+    """
+    _refresh_trades_cache()
+    groups  = _cache["groups"]
+    markets = _cache["markets"]
+    if not groups:
+        return []
+    hashes = list({g["market_hash"] for g in groups})
+    orders = client.fetch_orders(hashes)  # única llamada "live"
     return find_surebets(groups, markets, orders)
 
 
