@@ -11,6 +11,16 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 load_dotenv()  # carga variables desde .env si existe
 
+VERSION = "1.3.0"
+VERSION_DATE = "2026-02-10"
+VERSION_NOTES = [
+    "✅ Detección de surebets en apuestas activas",
+    "✅ Monitor automático con doble intervalo (órdenes / trades)",
+    "✅ Caché inteligente: órdenes cada Xs, trades cada 60s",
+    "✅ Detección automática de rate limit 429",
+    "✅ Comandos: /surebets /activas /stats /historial /estado /version",
+]
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, ContextTypes
@@ -79,6 +89,19 @@ def roi_emoji(roi: float) -> str:
 #  COMANDOS
 # ─────────────────────────────────────────────────────────────
 
+async def cmd_version(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not auth(update): return
+    notes = "\n".join(f"  {_escape(n)}" for n in VERSION_NOTES)
+    text = (
+        "🤖 *SX\\.bet Surebet Bot*\n\n"
+        f"Versi\u00f3n: `{VERSION}`\n"
+        f"Fecha: `{VERSION_DATE}`\n\n"
+        "*Cambios incluidos:*\n"
+        + notes
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2)
+
+
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not auth(update): return
     text = (
@@ -91,6 +114,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "🔔 /monitor\\_on — Activar alertas automáticas\n"
         "🔕 /monitor\\_off — Desactivar alertas\n"
         "ℹ️ /estado — Estado del monitor\n"
+        "🔢 /version — Versión del bot\n"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2)
 
@@ -438,6 +462,7 @@ def main():
     app.add_handler(CommandHandler("monitor_on",  cmd_monitor_on))
     app.add_handler(CommandHandler("monitor_off", cmd_monitor_off))
     app.add_handler(CommandHandler("estado",      cmd_estado))
+    app.add_handler(CommandHandler("version",     cmd_version))
     app.add_handler(CallbackQueryHandler(callback_handler))
 
     log.info("Bot iniciado ✅")
