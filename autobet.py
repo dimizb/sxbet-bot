@@ -126,61 +126,80 @@ class AutoBetEngine:
 
     # ── Órdenes disponibles ──────────────────────────────────
 
-    def get_best_orders(self, market_hash: str, want_outcome_one: bool) -> list:
+    def get_best_orders(self, market_hash: str, want_outcome_one: bool, max_retries: int = 3) -> list:
         """
         Devuelve las mejores órdenes disponibles para apostar 'want_outcome_one'.
         Ordena por mejor cuota taker (mayor a menor).
+        
+        Si no hay órdenes, reintenta hasta max_retries veces con espera.
         """
-        try:
-            r = self.session.get(
-                f"{API_BASE}/orders",
-                params={"marketHashes": market_hash},
-                timeout=10
-            )
-            body = r.json()
-            if body.get("status") != "success":
+        for attempt in range(max_retries):
+            try:
+                r = self.session.get(
+                    f"{API_BASE}/orders",
+                    params={"marketHashes": market_hash},
+                    timeout=10
+                )
+                body = r.json()
+                if body.get("status") != "success":
+                    if attempt < max_retries - 1:
+                        time.sleep(3 + attempt)  # 3s, 4s, 5s
+                        continue
+                    return []
+
+                data = body.get("data", [])
+                orders_flat = []
+                if isinstance(data, list):
+                    orders_flat = data
+                elif isinstance(data, dict):
+                    for arr in data.values():
+                        if isinstance(arr, list):
+                            orders_flat.extend(arr)
+
+                # Para apostar outcome_one como TAKER, necesito makers en outcome_two (y viceversa)
+                # Un maker que hace outcome_one → yo como taker hago outcome_two, y al revés
+                matching = []
+                for o in orders_flat:
+                    maker_side = bool(o.get("isMakerBettingOutcomeOne"))
+                    if maker_side == want_outcome_one:
+                        continue  # mismo lado, no aplica
+                    try:
+                        pct = float(o["percentageOdds"]) / ODDS_SCALE
+                        if 0 < pct < 1:
+                            taker_odds = 1.0 / (1.0 - pct)
+                            fillable   = float(o.get("fillAmount", 0)) / USDC_SCALE
+                            if fillable > 0:
+                                matching.append({
+                                    "orderHash":    o["orderHash"],
+                                    "market_hash":  o.get("marketHash", market_hash),
+                                    "taker_odds":   taker_odds,
+                                    "pct_odds_raw": int(o["percentageOdds"]),
+                                    "fillable_usdc": fillable,
+                                    "outcome_one":  want_outcome_one,
+                                })
+                    except Exception:
+                        pass
+
+                # Si encontramos órdenes, retornar
+                if matching:
+                    matching.sort(key=lambda x: x["taker_odds"], reverse=True)
+                    log.info(f"Found {len(matching)} orders on attempt {attempt+1}")
+                    return matching
+                
+                # No hay órdenes, reintentar
+                if attempt < max_retries - 1:
+                    log.info(f"No orders found, retrying in {3+attempt}s (attempt {attempt+1}/{max_retries})")
+                    time.sleep(3 + attempt)
+
+            except Exception as e:
+                log.error(f"get_best_orders error: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(3 + attempt)
+                    continue
                 return []
-
-            data = body.get("data", [])
-            orders_flat = []
-            if isinstance(data, list):
-                orders_flat = data
-            elif isinstance(data, dict):
-                for arr in data.values():
-                    if isinstance(arr, list):
-                        orders_flat.extend(arr)
-
-            # Para apostar outcome_one como TAKER, necesito makers en outcome_two (y viceversa)
-            # Un maker que hace outcome_one → yo como taker hago outcome_two, y al revés
-            matching = []
-            for o in orders_flat:
-                maker_side = bool(o.get("isMakerBettingOutcomeOne"))
-                if maker_side == want_outcome_one:
-                    continue  # mismo lado, no aplica
-                try:
-                    pct = float(o["percentageOdds"]) / ODDS_SCALE
-                    if 0 < pct < 1:
-                        taker_odds = 1.0 / (1.0 - pct)
-                        fillable   = float(o.get("fillAmount", 0)) / USDC_SCALE
-                        if fillable > 0:
-                            matching.append({
-                                "orderHash":    o["orderHash"],
-                                "market_hash":  o.get("marketHash", market_hash),
-                                "taker_odds":   taker_odds,
-                                "pct_odds_raw": int(o["percentageOdds"]),
-                                "fillable_usdc": fillable,
-                                "outcome_one":  want_outcome_one,
-                            })
-                except Exception:
-                    pass
-
-            # Mejor cuota primero
-            matching.sort(key=lambda x: x["taker_odds"], reverse=True)
-            return matching
-
-        except Exception as e:
-            log.error(f"get_best_orders error: {e}")
-            return []
+        
+        log.warning(f"No orders found after {max_retries} attempts")
+        return []
 
     # ── Firma EIP712 ─────────────────────────────────────────
 
@@ -278,12 +297,12 @@ class AutoBetEngine:
                 )
                 hedge_stake_usdc = available
 
-        # 1. Obtener mejores órdenes disponibles
-        orders = self.get_best_orders(market_hash, betting_outcome_one)
+        # 1. Obtener mejores órdenes disponibles (con reintentos)
+        orders = self.get_best_orders(market_hash, betting_outcome_one, max_retries=3)
         if not orders:
             return {
                 "success": False,
-                "message": "No hay órdenes disponibles en el lado contrario ahora mismo."
+                "message": "No hay órdenes disponibles después de 3 intentos (orderbook vacío en live)."
             }
 
         # 2. Filtrar por cuota mínima

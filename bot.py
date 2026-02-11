@@ -11,19 +11,18 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 load_dotenv()  # carga variables desde .env si existe
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 VERSION_DATE = "2026-02-11"
 VERSION_NOTES = [
-    "✅ NUEVO: Verificación de balance USDC antes de cada autobet",
-    "✅ NUEVO: Stake de cobertura se reduce automáticamente si no hay saldo suficiente",
-    "✅ NUEVO: /saldo — ver balance disponible en tiempo real",
+    "✅ NUEVO: /analisis — escanea mercados pre-partido y recomienda dónde apostar",
+    "✅ NUEVO: Sistema de score (100 puntos) basado en cuota, liquidez, timing y deporte",
+    "✅ NUEVO: AutoBet reintenta 3 veces si no hay órdenes (espera 3-5s entre intentos)",
+    "✅ Verificación de balance USDC antes de cada autobet",
+    "✅ Stake de cobertura se reduce automáticamente si no hay saldo suficiente",
+    "✅ /saldo — ver balance disponible en tiempo real",
     "✅ AutoBet — cierra surebets automáticamente con clave privada",
     "✅ /autobet_on / /autobet_off — activar/desactivar autobet",
     "✅ Detección de surebets en apuestas activas",
-    "✅ Monitor automático con doble intervalo (órdenes / trades)",
-    "✅ Detección de partidos en LIVE con marcador en /activas",
-    "✅ /setroi — ROI mínimo configurable desde Telegram",
-    "✅ SUREBET CONSEGUIDA: detecta ambas patas y deja de notificar",
 ]
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -34,6 +33,7 @@ from telegram.constants import ParseMode
 
 from sxbet import SXBetClient, find_surebets, get_stats, get_stats_with_markets, detect_closed_surebets
 from autobet import AutoBetEngine
+from analysis import analyze_prematches
 
 # ─────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -161,7 +161,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Comandos disponibles:\n"
         "🔍 /surebets — Buscar surebets ahora\n"
         "📋 /activas — Apuestas activas\n"
-        "📊 /stats — Estadísticas generales\n"
+        "📊 /analisis — Análisis pre\\-partido \\(dónde apostar\\)\n"
+        "📈 /stats — Estadísticas generales\n"
         "📅 /historial — Últimas 20 apuestas\n"
         "🔔 /monitor\\_on — Activar alertas automáticas\n"
         "🔕 /monitor\\_off — Desactivar alertas\n"
@@ -388,6 +389,17 @@ async def cmd_saldo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"Estado: {status}",
             parse_mode=ParseMode.MARKDOWN_V2
         )
+    except Exception as e:
+        await msg.edit_text(f"❌ Error: {_escape(str(e))}", parse_mode=ParseMode.MARKDOWN_V2)
+
+
+async def cmd_analisis(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Analiza mercados pre-partido y recomienda dónde apostar."""
+    if not auth(update): return
+    msg = await update.message.reply_text("📊 Analizando mercados pre\\-partido…", parse_mode=ParseMode.MARKDOWN_V2)
+    try:
+        result = await asyncio.to_thread(_get_analisis)
+        await msg.edit_text(result, parse_mode=ParseMode.MARKDOWN_V2)
     except Exception as e:
         await msg.edit_text(f"❌ Error: {_escape(str(e))}", parse_mode=ParseMode.MARKDOWN_V2)
 
@@ -676,6 +688,82 @@ def _get_activas() -> str:
 
     return "\n".join(lines)
 
+
+def _get_analisis() -> str:
+    """Analiza mercados pre-partido y devuelve recomendaciones."""
+    import requests
+    
+    # Obtener mercados activos (pre-partido + live)
+    try:
+        r = client.session.get(
+            f"https://api.sx.bet/markets/active",
+            timeout=15
+        )
+        body = r.json()
+        if body.get("status") != "success":
+            return "❌ Error obteniendo mercados\\."
+        
+        all_markets = body.get("data", [])
+        # Convertir a dict
+        markets_dict = {m["marketHash"]: m for m in all_markets}
+        
+        # Obtener órdenes de todos los mercados (batch por 30)
+        hashes = list(markets_dict.keys())
+        all_orders = client.fetch_orders(hashes)
+        
+        # Analizar
+        opps = analyze_prematches(markets_dict, all_orders, min_roi=MIN_ROI)
+        
+        if not opps:
+            return (
+                "📊 *Análisis Pre\\-Partido*\n\n"
+                "No hay oportunidades destacadas ahora mismo\\.\n"
+                "Verifica de nuevo en 30\\-60 minutos\\."
+            )
+        
+        # Top 5
+        top = opps[:5]
+        lines = [f"📊 *Análisis Pre\\-Partido* \\(Top {len(top)}\\)\n"]
+        
+        medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+        for i, opp in enumerate(top):
+            medal = medals[i] if i < len(medals) else "•"
+            evento = f"{opp['team1']} vs {opp['team2']}"
+            sport_icon = {"Tennis": "🎾", "Basketball": "🏀", "Soccer": "⚽", "Baseball": "⚾"}.get(opp["sport"], "🏆")
+            
+            hours = opp["hours_until"]
+            if hours < 1:
+                time_str = f"{int(hours * 60)}min"
+            else:
+                time_str = f"{hours:.1f}h"
+            
+            viable_icon = "✅" if opp["viable"] else "❌"
+            
+            lines.append(
+                f"{medal} *{_escape(evento)}*  {sport_icon} {_escape(opp['league'])}\n"
+                f"   {_escape(opp['side'])} @ `{opp['odds']:.2f}` — Liquidez: `{opp['liquidity']:.0f}` USDC\n"
+                f"   Empieza en: `{time_str}`\n"
+                f"   📌 Para ROI≥`{MIN_ROI:.0f}%`: necesitas {_escape(opp['opp_side'])} @ `{opp['required_odds']:.2f}` "
+                f"\\(actual: `{opp['opp_odds']:.2f}` {viable_icon}\\)\n"
+                f"   {_escape(opp['recommendation'])} — Score: `{opp['score']:.0f}/100`\n"
+            )
+        
+        # Mostrar rechazadas si hay
+        rejected = [o for o in opps if o["score"] < 50 or not o["viable"] or o["liquidity"] < 100][:3]
+        if rejected and len(top) < len(opps):
+            lines.append("\n⚠️ *EVITAR:*")
+            for opp in rejected:
+                evento = f"{opp['team1']} vs {opp['team2']}"
+                reason = opp['recommendation']
+                lines.append(f"❌ {_escape(evento)} — {_escape(reason)}")
+        
+        return "\n".join(lines)
+        
+    except Exception as e:
+        log.error(f"_get_analisis error: {e}")
+        return f"❌ Error en análisis: {_escape(str(e))}"
+
+
 def _get_stats() -> str:
     trades = client.fetch_all_trades()
     if not trades:
@@ -904,6 +992,7 @@ def main():
     app.add_handler(CommandHandler("start",          cmd_start))
     app.add_handler(CommandHandler("surebets",       cmd_surebets))
     app.add_handler(CommandHandler("activas",        cmd_activas))
+    app.add_handler(CommandHandler("analisis",       cmd_analisis))
     app.add_handler(CommandHandler("stats",          cmd_stats))
     app.add_handler(CommandHandler("historial",      cmd_historial))
     app.add_handler(CommandHandler("monitor_on",     cmd_monitor_on))
