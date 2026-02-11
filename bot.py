@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 load_dotenv()  # carga variables desde .env si existe
 
-VERSION = "1.5.1"
+VERSION = "1.7.0"
 VERSION_DATE = "2026-02-10"
 VERSION_NOTES = [
     "✅ Detección de surebets en apuestas activas",
@@ -24,6 +24,9 @@ VERSION_NOTES = [
     "✅ /setroi — ROI mínimo configurable desde Telegram",
     "✅ MIN_ROI como variable de entorno (default 1%)",
     "✅ Fix: /activas ahora detecta correctamente partidos en LIVE",
+    "✅ SUREBET CONSEGUIDA: detecta ambas patas y deja de notificar",
+    "✅ Estadísticas incluyen surebets cerradas y ROI medio",
+    "✅ Recomendación de stake y cuota mínima en /activas para cada apuesta",
 ]
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -32,7 +35,7 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode
 
-from sxbet import SXBetClient, find_surebets, get_stats, get_stats_with_markets
+from sxbet import SXBetClient, find_surebets, get_stats, get_stats_with_markets, detect_closed_surebets
 
 # ─────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -335,7 +338,12 @@ def _fetch_surebets_raw() -> list:
         return []
     hashes = list({g["market_hash"] for g in groups})
     orders = client.fetch_orders(hashes)  # única llamada "live"
-    return find_surebets(groups, markets, orders, min_roi=MIN_ROI)
+    closed = detect_closed_surebets(groups)
+    closed_hashes = set(closed.keys())
+    return [
+        sb for sb in find_surebets(groups, markets, orders, min_roi=MIN_ROI)
+        if sb["market_hash"] not in closed_hashes
+    ]
 
 
 def _scan_surebets() -> str:
@@ -355,6 +363,30 @@ def _scan_surebets() -> str:
     return "\n".join(lines)
 
 
+def _hedge_recommendation(stake_a: float, odds_a: float, min_roi: float) -> dict:
+    """
+    Calcula el stake y cuota mínima necesaria en el lado contrario
+    para conseguir exactamente min_roi% de beneficio garantizado.
+    """
+    potential_a = stake_a * odds_a
+    r = min_roi / 100.0
+    # Stake óptimo de cobertura (iguala los dos escenarios)
+    stake_b = (potential_a - stake_a * (1 + r)) / (1 + r)
+    if stake_b <= 0:
+        return None  # cuota demasiado baja para cubrir con beneficio
+    odds_b_min  = potential_a / stake_b
+    total_stake = stake_a + stake_b
+    guaranteed  = potential_a - stake_a - stake_b
+    roi         = guaranteed / total_stake * 100
+    return {
+        "stake_b":      stake_b,
+        "odds_b_min":   odds_b_min,
+        "total_stake":  total_stake,
+        "guaranteed":   guaranteed,
+        "roi":          roi,
+    }
+
+
 def _get_activas() -> str:
     trades  = client.fetch_all_trades(settled=False)
     if not trades:
@@ -363,10 +395,12 @@ def _get_activas() -> str:
     groups  = client.group_trades(trades)
     hashes  = list({g["market_hash"] for g in groups})
     markets = client.fetch_markets(hashes)
+    closed  = detect_closed_surebets(groups)  # mercados con ambas patas
 
     import time as _t
     now = _t.time()
 
+    surebet_bets = []
     live_bets    = []
     pending_bets = []
 
@@ -391,39 +425,90 @@ def _get_activas() -> str:
             "sport": sport, "league": league, "evento": evento,
             "side": side, "g": g, "is_live": is_live,
             "score_str": score_str, "game_time": game_time,
+            "market_hash": g["market_hash"],
         }
-        if is_live:
+
+        if g["market_hash"] in closed:
+            # Solo añadir una vez por mercado (la pata 1)
+            if g["betting_outcome_one"]:
+                sb_info = closed[g["market_hash"]]
+                entry["sb_info"] = sb_info
+                surebet_bets.append(entry)
+        elif is_live:
             live_bets.append(entry)
         else:
             pending_bets.append(entry)
 
-    lines = [f"📋 *{len(groups)} apuesta{'s' if len(groups)>1 else ''} activa{'s' if len(groups)>1 else ''}*\n"]
+    total = len(groups)
+    lines = [f"📋 *{total} apuesta{'s' if total>1 else ''} activa{'s' if total>1 else ''}*\n"]
+
+    if surebet_bets:
+        lines.append(f"✅ *SUREBET CONSEGUIDA \\({len(surebet_bets)}\\)*")
+        for e in surebet_bets:
+            sb  = e["sb_info"]
+            mkt = markets.get(e["market_hash"], {})
+            side1_name = mkt.get("outcomeOneName", "O1")
+            side2_name = mkt.get("outcomeTwoName", "O2")
+            leg1 = sb["leg1"]
+            leg2 = sb["leg2"]
+            live_str = " 🔴 LIVE" + e["score_str"] if e["is_live"] else ""
+            lines.append(
+                f"✅ *{_escape(e['evento'])}*{_escape(live_str)}\n"
+                f"   {_escape(e['sport'])} — {_escape(e['league'])}\n"
+                f"   Pata 1: {_escape(side1_name)} @ `{leg1['avg_odds']:.3f}` — `{leg1['total_stake']:.2f}` USDC\n"
+                f"   Pata 2: {_escape(side2_name)} @ `{leg2['avg_odds']:.3f}` — `{leg2['total_stake']:.2f}` USDC\n"
+                f"   💰 Beneficio garantizado: *`{sb['guaranteed']:+.2f}` USDC* \\(`{sb['roi']:+.1f}%`\\)"
+            )
 
     if live_bets:
+        if surebet_bets: lines.append("")
         lines.append(f"🔴 *EN LIVE \\({len(live_bets)}\\)*")
         for e in sorted(live_bets, key=lambda x: x["game_time"]):
-            g = e["g"]
+            g   = e["g"]
+            rec = _hedge_recommendation(g["total_stake"], g["avg_odds"], MIN_ROI)
+            mkt = markets.get(e["market_hash"], {})
+            opp_side = mkt.get("outcomeTwoName","O2") if g["betting_outcome_one"] else mkt.get("outcomeOneName","O1")
+            if rec:
+                rec_line = (
+                    f"   📌 Para ROI≥`{MIN_ROI:.0f}%`: apostar `{rec['stake_b']:.2f}` USDC"
+                    f" a *{_escape(opp_side)}* @ cuota≥`{rec['odds_b_min']:.3f}`"
+                    f" → `{rec['guaranteed']:+.2f}` USDC garantizados"
+                )
+            else:
+                rec_line = f"   📌 Cuota insuficiente para cubrir con ROI≥`{MIN_ROI:.0f}%`"
             lines.append(
                 f"🔴 *{_escape(e['evento'])}*{e['score_str']}\n"
                 f"   {_escape(e['sport'])} — {_escape(e['league'])}\n"
                 f"   {_escape(e['side'])} @ `{g['avg_odds']:.3f}` — Stake: `{g['total_stake']:.2f}` USDC\n"
-                f"   Retorno potencial: `{g['potential_win']:.2f}` USDC"
+                f"   Retorno potencial: `{g['potential_win']:.2f}` USDC\n"
+                f"{rec_line}"
             )
 
     if pending_bets:
-        if live_bets:
-            lines.append("")
+        if surebet_bets or live_bets: lines.append("")
         lines.append(f"⏳ *PENDIENTES \\({len(pending_bets)}\\)*")
         for e in sorted(pending_bets, key=lambda x: x["game_time"]):
-            g = e["g"]
-            gt    = e["game_time"]
+            g   = e["g"]
+            gt  = e["game_time"]
+            rec = _hedge_recommendation(g["total_stake"], g["avg_odds"], MIN_ROI)
+            mkt = markets.get(e["market_hash"], {})
+            opp_side = mkt.get("outcomeTwoName","O2") if g["betting_outcome_one"] else mkt.get("outcomeOneName","O1")
             from datetime import datetime, timezone as tz
             fecha = datetime.fromtimestamp(gt, tz=tz.utc).strftime("%d/%m %H:%M") if gt else "?"
+            if rec:
+                rec_line = (
+                    f"   📌 Para ROI≥`{MIN_ROI:.0f}%`: apostar `{rec['stake_b']:.2f}` USDC"
+                    f" a *{_escape(opp_side)}* @ cuota≥`{rec['odds_b_min']:.3f}`"
+                    f" → `{rec['guaranteed']:+.2f}` USDC garantizados"
+                )
+            else:
+                rec_line = f"   📌 Cuota insuficiente para cubrir con ROI≥`{MIN_ROI:.0f}%`"
             lines.append(
                 f"⏳ {_escape(e['evento'])}\n"
                 f"   {_escape(e['sport'])} — {_escape(e['league'])}\n"
                 f"   {_escape(e['side'])} @ `{g['avg_odds']:.3f}` — Stake: `{g['total_stake']:.2f}` USDC\n"
-                f"   Partido: `{_escape(fecha)} UTC`"
+                f"   Partido: `{_escape(fecha)} UTC`\n"
+                f"{rec_line}"
             )
 
     return "\n".join(lines)
@@ -441,6 +526,7 @@ def _get_stats() -> str:
         "📊 *Estadísticas Generales*\n",
         f"Total apuestas: `{s['total']}`",
         f"Activas: `{s['active']}`   Liquidadas: `{s['settled']}`",
+        f"✅ Surebets conseguidas: `{s['surebets_closed']}`" + (f"  ROI medio: `{s['surebets_roi_avg']:+.1f}%`" if s['surebets_closed'] > 0 else ""),
         f"Ganadas: `{s['won']}` ✅   Perdidas: `{s['lost']}` ❌   Void: `{s['void']}` ↩️",
         f"% Acierto: `{s['win_rate']:.1f}%`",
         f"Stake total: `{s['total_stake']:.2f}` USDC",

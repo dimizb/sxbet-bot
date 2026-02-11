@@ -332,6 +332,52 @@ def find_surebets(groups: list, markets: dict, orders: dict, min_roi: float = 0.
 
 
 # ─────────────────────────────────────────────────────────────
+#  SUREBETS CERRADAS (dos patas activas en mismo mercado)
+# ─────────────────────────────────────────────────────────────
+
+def detect_closed_surebets(groups: list) -> dict:
+    """
+    Detecta mercados donde tenemos apuestas activas en AMBOS lados.
+    Retorna {market_hash: {leg1, leg2, total_stake, guaranteed_profit, roi}}
+    """
+    active = [g for g in groups if not g["settled"]]
+
+    # Agrupar activas por market_hash
+    by_market: dict = {}
+    for g in active:
+        by_market.setdefault(g["market_hash"], []).append(g)
+
+    closed: dict = {}
+    for mh, legs in by_market.items():
+        # Buscar si hay una pata en cada lado
+        side1 = next((l for l in legs if     l["betting_outcome_one"]), None)
+        side2 = next((l for l in legs if not l["betting_outcome_one"]), None)
+
+        if not side1 or not side2:
+            continue  # Solo un lado apostado
+
+        total_stake = side1["total_stake"] + side2["total_stake"]
+        # Beneficio garantizado = min(retorno1 - total, retorno2 - total)
+        profit1 = side1["potential_win"] - total_stake
+        profit2 = side2["potential_win"] - total_stake
+        guaranteed = min(profit1, profit2)
+        roi = (guaranteed / total_stake * 100) if total_stake > 0 else 0.0
+
+        closed[mh] = {
+            "market_hash":    mh,
+            "leg1":           side1,
+            "leg2":           side2,
+            "total_stake":    total_stake,
+            "profit1":        profit1,
+            "profit2":        profit2,
+            "guaranteed":     guaranteed,
+            "roi":            roi,
+        }
+
+    return closed
+
+
+# ─────────────────────────────────────────────────────────────
 #  ESTADÍSTICAS
 # ─────────────────────────────────────────────────────────────
 
@@ -373,18 +419,26 @@ def get_stats(groups: list) -> dict:
         dec = s["won"] + s["lost"]
         s["roi"] = (s["pnl"] / s["stake"] * 100) if s["stake"] > 0 else 0.0
 
+    # Surebets cerradas activas (ambas patas sin liquidar)
+    closed_sb = detect_closed_surebets(groups)
+
     return {
-        "total":       len(groups),
-        "active":      len(active),
-        "settled":     len(settled),
-        "won":         len(won),
-        "lost":        len(lost),
-        "void":        len(void),
-        "win_rate":    win_rate,
-        "total_stake": total_stake,
-        "pnl":         pnl,
-        "roi":         roi,
-        "by_sport":    by_sport,
+        "total":           len(groups),
+        "active":          len(active),
+        "settled":         len(settled),
+        "won":             len(won),
+        "lost":            len(lost),
+        "void":            len(void),
+        "win_rate":        win_rate,
+        "total_stake":     total_stake,
+        "pnl":             pnl,
+        "roi":             roi,
+        "by_sport":        by_sport,
+        "surebets_closed": len(closed_sb),
+        "surebets_roi_avg": (
+            sum(v["roi"] for v in closed_sb.values()) / len(closed_sb)
+            if closed_sb else 0.0
+        ),
     }
 
 
