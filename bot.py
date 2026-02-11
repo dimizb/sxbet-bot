@@ -799,15 +799,15 @@ async def cmd_debugtrades(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "Wallet: `" + _escape(wallet[:20]) + "`",
             "HTTP activas: `" + str(r_active.status_code) + "`",
             "Trades activos: `" + str(n_active) + "`",
-            "Trades totales \(5\): `" + str(n_all) + "`",
+            r"Trades totales \(5\): `" + str(n_all) + "`",
         ]
         if n_all == 0:
             lines += [
                 "",
-                "⚠️ La wallet no tiene historial en SX\.bet",
-                "Confirma en SX\.bet → Portfolio que la wallet",
+                r"⚠️ La wallet no tiene historial en SX\.bet",
+                r"Confirma en SX\.bet → Portfolio que la wallet",
                 "`" + _escape(wallet) + "`",
-                "tiene apuestas realizadas\.",
+                r"tiene apuestas realizadas\.",
             ]
         await msg.edit_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2)
     except Exception as e:

@@ -19,7 +19,6 @@ from typing import Optional
 
 import requests
 from eth_account import Account
-from eth_account.messages import encode_structured_data
 from web3 import Web3
 
 log = logging.getLogger(__name__)
@@ -147,57 +146,6 @@ class AutoBetEngine:
 
     # ── Firma EIP712 ─────────────────────────────────────────
 
-    def _build_eip712_fill_payload(
-        self,
-        order_hash: str,
-        taker_amount_raw: int,
-        pct_odds_raw: int,
-        market_hash: str,
-        betting_outcome_one: bool,
-        fill_salt_hex: str,
-    ) -> dict:
-        """
-        Construye el payload EIP712 para firmar el fill de una orden.
-        Estructura basada en FillOrderSportX v5.0.
-        """
-        domain_salt = self._get_domain_salt()
-
-        return {
-            "types": {
-                "EIP712Domain": [
-                    {"name": "name",    "type": "string"},
-                    {"name": "version", "type": "string"},
-                    {"name": "chainId", "type": "uint256"},
-                    {"name": "salt",    "type": "bytes32"},
-                ],
-                "Details": [
-                    {"name": "action",    "type": "string"},
-                    {"name": "market",    "type": "string"},
-                    {"name": "betting",   "type": "string"},
-                    {"name": "stake",     "type": "string"},
-                    {"name": "odds",      "type": "string"},
-                    {"name": "orderHash", "type": "string"},
-                    {"name": "fillSalt",  "type": "bytes32"},
-                ],
-            },
-            "primaryType": "Details",
-            "domain": {
-                "name":    "FillOrderSportX",
-                "version": DOMAIN_VERSION,
-                "chainId": CHAIN_ID,
-                "salt":    domain_salt,
-            },
-            "message": {
-                "action":    "N/A",
-                "market":    market_hash,
-                "betting":   "true" if betting_outcome_one else "false",
-                "stake":     str(taker_amount_raw),
-                "odds":      str(pct_odds_raw),
-                "orderHash": order_hash,
-                "fillSalt":  bytes.fromhex(fill_salt_hex),
-            },
-        }
-
     def _sign_fill(
         self,
         order_hash: str,
@@ -208,12 +156,40 @@ class AutoBetEngine:
         fill_salt_hex: str,
     ) -> str:
         """Firma el fill order y devuelve la firma hex."""
-        payload = self._build_eip712_fill_payload(
-            order_hash, taker_amount_raw, pct_odds_raw,
-            market_hash, betting_outcome_one, fill_salt_hex
+        domain_salt = self._get_domain_salt()
+
+        domain = {
+            "name":    "FillOrderSportX",
+            "version": DOMAIN_VERSION,
+            "chainId": CHAIN_ID,
+            "salt":    "0x" + domain_salt.hex(),
+        }
+        types = {
+            "Details": [
+                {"name": "action",    "type": "string"},
+                {"name": "market",    "type": "string"},
+                {"name": "betting",   "type": "string"},
+                {"name": "stake",     "type": "string"},
+                {"name": "odds",      "type": "string"},
+                {"name": "orderHash", "type": "string"},
+                {"name": "fillSalt",  "type": "bytes32"},
+            ],
+        }
+        message = {
+            "action":    "N/A",
+            "market":    market_hash,
+            "betting":   "true" if betting_outcome_one else "false",
+            "stake":     str(taker_amount_raw),
+            "odds":      str(pct_odds_raw),
+            "orderHash": order_hash,
+            "fillSalt":  "0x" + fill_salt_hex,
+        }
+
+        signed = self.account.sign_typed_data(
+            domain_data   = domain,
+            message_types = types,
+            message_data  = message,
         )
-        msg    = encode_structured_data(payload)
-        signed = self.account.sign_message(msg)
         return "0x" + signed.signature.hex()
 
     # ── Ejecutar apuesta ────────────────────────────────────
