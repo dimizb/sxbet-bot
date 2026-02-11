@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 load_dotenv()  # carga variables desde .env si existe
 
-VERSION = "1.7.4"
+VERSION = "1.7.5"
 VERSION_DATE = "2026-02-10"
 VERSION_NOTES = [
     "✅ Detección de surebets en apuestas activas",
@@ -633,34 +633,45 @@ def _format_surebet_alert(sb: dict, compact: bool = False) -> str:
 # ─────────────────────────────────────────────────────────────
 
 async def cmd_debugtrades(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Muestra respuesta cruda de la API de trades para diagnosticar el problema."""
+    """Consulta la API directamente con la sesión del cliente."""
     if not auth(update): return
-    msg = await update.message.reply_text("🔍 Consultando API directamente...")
+    msg = await update.message.reply_text("🔍 Consultando API...")
     try:
-        import requests as _req
         wallet = client.wallet
-        url = "https://api.sx.bet/trades?bettor=" + wallet + "&settled=false&pageSize=5"
-        headers = {"X-Api-Key": client.api_key} if client.api_key else {}
-        r = _req.get(url, headers=headers, timeout=10)
-        data = r.json()
-        trades = data.get("data", {}).get("trades", [])
-        api_status = data.get("status", "?")
+        # Usar la sesión del cliente (ya tiene X-Api-Key en headers)
+        r_active   = client.session.get(
+            "https://api.sx.bet/trades",
+            params={"bettor": wallet, "settled": "false", "pageSize": "5"},
+            timeout=10
+        )
+        r_all      = client.session.get(
+            "https://api.sx.bet/trades",
+            params={"bettor": wallet, "pageSize": "5"},
+            timeout=10
+        )
+        d_active = r_active.json()
+        d_all    = r_all.json()
+        n_active = len(d_active.get("data", {}).get("trades", []))
+        n_all    = len(d_all.get("data", {}).get("trades", []))
         lines = [
-            "🔍 *Debug API trades*",
+            "🔍 *Debug API Trades*",
             "",
-            "Wallet: `" + _escape(wallet[:16]) + "\\.\\.\\.\`",
-            "HTTP: `" + str(r.status_code) + "`",
-            "API status: `" + _escape(api_status) + "`",
-            "Trades activos: `" + str(len(trades)) + "`",
+            "Wallet: `" + _escape(wallet[:20]) + "`",
+            "HTTP activas: `" + str(r_active.status_code) + "`",
+            "Trades activos: `" + str(n_active) + "`",
+            "Trades totales \(5\): `" + str(n_all) + "`",
         ]
-        if not trades:
-            lines.append("")
-            lines.append("⚠️ API devuelve 0 trades")
-            lines.append("Verifica `SX\\_WALLET` en Railway")
-            lines.append("Debe tener mayúsculas/minúsculas exactas")
+        if n_all == 0:
+            lines += [
+                "",
+                "⚠️ La wallet no tiene historial en SX\.bet",
+                "Confirma en SX\.bet → Portfolio que la wallet",
+                "`" + _escape(wallet) + "`",
+                "tiene apuestas realizadas\.",
+            ]
         await msg.edit_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2)
     except Exception as e:
-        await msg.edit_text("❌ Error: " + _escape(str(e)), parse_mode=ParseMode.MARKDOWN_V2)
+        await msg.edit_text("❌ Error: `" + _escape(str(e)) + "`", parse_mode=ParseMode.MARKDOWN_V2)
 
 
 async def cmd_debugwallet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
