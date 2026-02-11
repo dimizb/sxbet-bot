@@ -704,12 +704,25 @@ def _get_analisis() -> str:
             return "❌ Error obteniendo mercados\\."
         
         all_markets = body.get("data", [])
-        # Convertir a dict
-        markets_dict = {m["marketHash"]: m for m in all_markets}
+        if not all_markets:
+            return "❌ No hay mercados disponibles ahora mismo\\."
+        
+        # Convertir a dict — cada elemento ya es un dict con marketHash
+        markets_dict = {}
+        for m in all_markets:
+            if isinstance(m, dict) and "marketHash" in m:
+                markets_dict[m["marketHash"]] = m
+        
+        if not markets_dict:
+            return "❌ No se pudo parsear mercados\\."
+        
+        log.info(f"Fetched {len(markets_dict)} markets for analysis")
         
         # Obtener órdenes de todos los mercados (batch por 30)
         hashes = list(markets_dict.keys())
         all_orders = client.fetch_orders(hashes)
+        
+        log.info(f"Fetched orders for {len(all_orders)} markets")
         
         # Analizar
         opps = analyze_prematches(markets_dict, all_orders, min_roi=MIN_ROI)
@@ -760,7 +773,7 @@ def _get_analisis() -> str:
         return "\n".join(lines)
         
     except Exception as e:
-        log.error(f"_get_analisis error: {e}")
+        log.error(f"_get_analisis error: {e}", exc_info=True)
         return f"❌ Error en análisis: {_escape(str(e))}"
 
 

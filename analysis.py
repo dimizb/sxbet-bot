@@ -39,10 +39,18 @@ def analyze_prematches(markets: dict, orders: dict, min_roi: float = 3.0) -> lis
     Returns:
         Lista de oportunidades ordenadas por score (100 = mejor)
     """
+    if not markets or not isinstance(markets, dict):
+        log.warning("analyze_prematches: markets vacío o no es dict")
+        return []
+    
     now = time.time()
     opportunities = []
     
     for mh, mkt in markets.items():
+        if not isinstance(mkt, dict):
+            log.warning(f"Market {mh} no es dict, skipping")
+            continue
+        
         # Solo pre-partido (gameTime en el futuro)
         game_time = mkt.get("gameTime", 0) or 0
         if game_time <= now or game_time <= 0:
