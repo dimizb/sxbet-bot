@@ -11,18 +11,18 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 load_dotenv()  # carga variables desde .env si existe
 
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 VERSION_DATE = "2026-02-11"
 VERSION_NOTES = [
-    "✅ NUEVO: /analisis — escanea mercados pre-partido y recomienda dónde apostar",
-    "✅ NUEVO: Sistema de score (100 puntos) basado en cuota, liquidez, timing y deporte",
-    "✅ NUEVO: AutoBet reintenta 3 veces si no hay órdenes (espera 3-5s entre intentos)",
+    "✅ NUEVO: Marcadores en vivo en alertas de surebet (ej: '🔴 6-4, 3-2 (Set 2)')",
+    "✅ NUEVO: fetch_active_markets() — método robusto para obtener mercados",
+    "✅ NUEVO: fetch_live_score() — obtiene marcadores en tiempo real",
+    "✅ FIX: /analisis ahora funciona correctamente (reescrito desde cero)",
+    "✅ Análisis pre-partido con score de 100 puntos",
+    "✅ AutoBet reintenta 3 veces si no hay órdenes disponibles",
     "✅ Verificación de balance USDC antes de cada autobet",
-    "✅ Stake de cobertura se reduce automáticamente si no hay saldo suficiente",
     "✅ /saldo — ver balance disponible en tiempo real",
     "✅ AutoBet — cierra surebets automáticamente con clave privada",
-    "✅ /autobet_on / /autobet_off — activar/desactivar autobet",
-    "✅ Detección de surebets en apuestas activas",
 ]
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -292,6 +292,28 @@ async def _monitor_job(ctx: ContextTypes.DEFAULT_TYPE):
                 continue  # ya avisamos de esta
             _notified.add(key)
 
+            # Enriquecer con live score si aplica
+            mkt = _cache["markets"].get(sb["market_hash"], {})
+            import time as _t
+            game_time = mkt.get("gameTime", 0) or 0
+            is_live = (0 < game_time <= _t.time())
+            sb["is_live"] = is_live
+            
+            score_str = ""
+            if is_live:
+                event_id = mkt.get("sportXEventId")
+                if event_id:
+                    live_data = await asyncio.to_thread(client.fetch_live_score, event_id)
+                    if live_data:
+                        s1 = live_data.get("teamOneScore", "?")
+                        s2 = live_data.get("teamTwoScore", "?")
+                        period = live_data.get("currentPeriod", "")
+                        if period:
+                            score_str = f" — {s1}\\-{s2} \\({_escape(period)}\\)"
+                        else:
+                            score_str = f" — {s1}\\-{s2}"
+            sb["score_str"] = score_str
+
             # ── AutoBet: ejecutar contra-apuesta automáticamente ──
             autobet_result = None
             if AUTO_BET_ENABLED and autobet_engine:
@@ -402,6 +424,40 @@ async def cmd_analisis(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text(result, parse_mode=ParseMode.MARKDOWN_V2)
     except Exception as e:
         await msg.edit_text(f"❌ Error: {_escape(str(e))}", parse_mode=ParseMode.MARKDOWN_V2)
+
+
+async def cmd_debug_markets(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Debug temporal: ver formato de respuesta de /markets/active."""
+    if not auth(update): return
+    msg = await update.message.reply_text("🔍 Consultando API…")
+    try:
+        r = client.session.get("https://api.sx.bet/markets/active", params={"liveOnly": "false"}, timeout=15)
+        body = r.json()
+        data = body.get("data", [])
+        
+        info_lines = [
+            f"Status: {body.get('status')}",
+            f"Data type: {type(data).__name__}",
+        ]
+        
+        if isinstance(data, list):
+            info_lines.append(f"Length: {len(data)}")
+            if data:
+                first = data[0]
+                info_lines.append(f"First element type: {type(first).__name__}")
+                if isinstance(first, dict):
+                    info_lines.append(f"Keys: {', '.join(list(first.keys())[:10])}")
+        elif isinstance(data, dict):
+            info_lines.append(f"Dict keys count: {len(data)}")
+            if data:
+                first_key = list(data.keys())[0]
+                first_val = data[first_key]
+                info_lines.append(f"First key: {first_key[:20]}...")
+                info_lines.append(f"First value type: {type(first_val).__name__}")
+        
+        await msg.edit_text("```\n" + "\n".join(info_lines) + "\n```", parse_mode="Markdown")
+    except Exception as e:
+        await msg.edit_text(f"Error: {str(e)}")
 
 
 async def cmd_autobet_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -534,7 +590,24 @@ def _scan_surebets() -> str:
         from time import time as _now2
         game_time = mkt.get("gameTime", 0) or 0
         is_live = (0 < game_time <= _now2())
+        
+        # Obtener marcador si es live
+        score_str = ""
+        if is_live:
+            event_id = mkt.get("sportXEventId")
+            if event_id:
+                live_data = client.fetch_live_score(event_id)
+                if live_data:
+                    s1 = live_data.get("teamOneScore", "?")
+                    s2 = live_data.get("teamTwoScore", "?")
+                    period = live_data.get("currentPeriod", "")
+                    if period:
+                        score_str = f" — {s1}\\-{s2} \\({_escape(period)}\\)"
+                    else:
+                        score_str = f" — {s1}\\-{s2}"
+        
         sb["is_live"] = is_live
+        sb["score_str"] = score_str
         lines.append(_format_surebet_alert(sb, compact=True))
     return "\n".join(lines)
 
@@ -691,35 +764,24 @@ def _get_activas() -> str:
 
 def _get_analisis() -> str:
     """Analiza mercados pre-partido y devuelve recomendaciones."""
-    import requests
-    
-    # Obtener mercados activos (pre-partido + live)
     try:
-        r = client.session.get(
-            f"https://api.sx.bet/markets/active",
-            timeout=15
-        )
-        body = r.json()
-        if body.get("status") != "success":
-            return "❌ Error obteniendo mercados\\."
-        
-        all_markets = body.get("data", [])
-        if not all_markets:
-            return "❌ No hay mercados disponibles ahora mismo\\."
-        
-        # Convertir a dict — cada elemento ya es un dict con marketHash
-        markets_dict = {}
-        for m in all_markets:
-            if isinstance(m, dict) and "marketHash" in m:
-                markets_dict[m["marketHash"]] = m
+        # Obtener mercados activos usando el cliente
+        log.info("Fetching active markets for analysis...")
+        markets_dict = client.fetch_active_markets(limit=150)
         
         if not markets_dict:
-            return "❌ No se pudo parsear mercados\\."
+            return (
+                "❌ No hay mercados disponibles\\.\n\n"
+                "Esto puede deberse a:\n"
+                "• Problemas con la API de SX\\.bet\n"
+                "• No hay partidos programados\n"
+                "• Verifica los logs del bot"
+            )
         
-        log.info(f"Fetched {len(markets_dict)} markets for analysis")
+        log.info(f"Analyzing {len(markets_dict)} markets")
         
-        # Obtener órdenes de todos los mercados (batch por 30)
-        hashes = list(markets_dict.keys())
+        # Obtener órdenes (limitar a primeros 100 para no sobrecargar)
+        hashes = list(markets_dict.keys())[:100]
         all_orders = client.fetch_orders(hashes)
         
         log.info(f"Fetched orders for {len(all_orders)} markets")
@@ -730,13 +792,18 @@ def _get_analisis() -> str:
         if not opps:
             return (
                 "📊 *Análisis Pre\\-Partido*\n\n"
-                "No hay oportunidades destacadas ahora mismo\\.\n"
-                "Verifica de nuevo en 30\\-60 minutos\\."
+                f"Escaneados {len(markets_dict)} mercados\\.\n"
+                "No hay oportunidades destacadas ahora mismo\\.\n\n"
+                "Posibles razones:\n"
+                "• Todos los partidos ya empezaron \\(son LIVE\\)\n"
+                "• No hay cuotas atractivas \\(>2\\.5\\)\n"
+                "• Poca liquidez disponible\n\n"
+                "💡 Intenta de nuevo en 1\\-2 horas\\."
             )
         
         # Top 5
         top = opps[:5]
-        lines = [f"📊 *Análisis Pre\\-Partido* \\(Top {len(top)}\\)\n"]
+        lines = [f"📊 *Análisis Pre\\-Partido* \\(Top {len(top)} de {len(opps)}\\)\n"]
         
         medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
         for i, opp in enumerate(top):
@@ -865,7 +932,8 @@ def _format_surebet_alert(sb: dict, compact: bool = False, autobet_result: dict 
     roi_e  = roi_emoji(roi)
 
     is_live   = sb.get("is_live", False)
-    live_badge = "🔴 LIVE — " if is_live else ""
+    score_str = sb.get("score_str", "")  # puede venir como "6-4 (Set 2)"
+    live_badge = f"🔴 LIVE{score_str} — " if is_live else ""
 
     # Línea de resultado autobet
     if autobet_result is not None:
@@ -889,7 +957,7 @@ def _format_surebet_alert(sb: dict, compact: bool = False, autobet_result: dict 
             + autobet_line
         )
 
-    live_line = "🔴 *PARTIDO EN LIVE*\n" if is_live else ""
+    live_line = f"🔴 *PARTIDO EN LIVE*{score_str}\n" if is_live else ""
     return (
         f"🎯 *¡SUREBET DETECTADA\\!*\n\n"
         f"{live_line}"
@@ -1020,6 +1088,7 @@ def main():
     app.add_handler(CommandHandler("debuglive",      cmd_debuglive))
     app.add_handler(CommandHandler("debugwallet",    cmd_debugwallet))
     app.add_handler(CommandHandler("debugtrades",    cmd_debugtrades))
+    app.add_handler(CommandHandler("debug_markets",  cmd_debug_markets))
     app.add_handler(CallbackQueryHandler(callback_handler))
 
     log.info("Bot iniciado ✅")

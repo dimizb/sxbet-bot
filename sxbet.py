@@ -130,6 +130,40 @@ class SXBetClient:
 
     # ── Mercados ────────────────────────────────────────────
 
+    def fetch_active_markets(self, sport_ids: list = None, limit: int = 200) -> dict:
+        """
+        Obtiene mercados activos (pre-partido y live).
+        Retorna {marketHash: marketData}.
+        """
+        try:
+            params = {}
+            if sport_ids:
+                params["sportId"] = ",".join(str(s) for s in sport_ids)
+            
+            body = self._get(f"{API_BASE}/markets/active", params=params)
+            if not body or body.get("status") != "success":
+                log.error(f"fetch_active_markets failed: {body}")
+                return {}
+            
+            data = body.get("data", [])
+            
+            # Puede venir como array o dict
+            result = {}
+            if isinstance(data, list):
+                for m in data[:limit]:
+                    if isinstance(m, dict) and "marketHash" in m:
+                        result[m["marketHash"]] = m
+            elif isinstance(data, dict):
+                # Ya es {marketHash: market}
+                result = dict(list(data.items())[:limit])
+            
+            log.info(f"fetch_active_markets: {len(result)} mercados")
+            return result
+            
+        except Exception as e:
+            log.error(f"fetch_active_markets error: {e}")
+            return {}
+
     def fetch_markets(self, hashes: list) -> dict:
         """Devuelve {marketHash: marketData} en batches de 30."""
         unique = list(dict.fromkeys(hashes))
@@ -196,6 +230,32 @@ class SXBetClient:
         total = sum(len(v) for v in result.values())
         log.info(f"fetch_orders: {total} órdenes en {len(result)} mercados")
         return result
+
+    # ── Live Scores ─────────────────────────────────────────
+
+    def fetch_live_score(self, sport_x_event_id: str) -> dict:
+        """
+        Obtiene el marcador en tiempo real de un partido.
+        Retorna dict con teamOneScore, teamTwoScore, currentPeriod, etc.
+        """
+        try:
+            body = self._get(
+                f"{API_BASE}/live-scores",
+                params={"sportXEventIds": sport_x_event_id}
+            )
+            if not body or body.get("status") != "success":
+                return {}
+            
+            data = body.get("data", {})
+            # La API devuelve {eventId: score_data}
+            if isinstance(data, dict) and sport_x_event_id in data:
+                return data[sport_x_event_id]
+            
+            return {}
+            
+        except Exception as e:
+            log.error(f"fetch_live_score error: {e}")
+            return {}
 
     # ── Agrupación de trades ────────────────────────────────
 
