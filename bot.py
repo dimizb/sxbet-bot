@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 load_dotenv()  # carga variables desde .env si existe
 
-VERSION = "1.7.0"
+VERSION = "1.7.1"
 VERSION_DATE = "2026-02-10"
 VERSION_NOTES = [
     "✅ Detección de surebets en apuestas activas",
@@ -27,6 +27,7 @@ VERSION_NOTES = [
     "✅ SUREBET CONSEGUIDA: detecta ambas patas y deja de notificar",
     "✅ Estadísticas incluyen surebets cerradas y ROI medio",
     "✅ Recomendación de stake y cuota mínima en /activas para cada apuesta",
+    "✅ Fix: detección LIVE basada solo en gameTime, no en liveEnabled",
 ]
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -357,7 +358,7 @@ def _scan_surebets() -> str:
         mkt = _cache["markets"].get(sb.get("market_hash", ""), {})
         from time import time as _now2
         game_time = mkt.get("gameTime", 0) or 0
-        is_live = (game_time > 0 and game_time <= _now2()) or mkt.get("liveEnabled", False)
+        is_live = (0 < game_time <= _now2())
         sb["is_live"] = is_live
         lines.append(_format_surebet_alert(sb, compact=True))
     return "\n".join(lines)
@@ -407,10 +408,9 @@ def _get_activas() -> str:
     for g in groups:
         mkt       = markets.get(g["market_hash"], {})
         game_time = mkt.get("gameTime", 0) or 0
-        live_en   = bool(mkt.get("liveEnabled", False))
         score1    = mkt.get("teamOneScore")
         score2    = mkt.get("teamTwoScore")
-        is_live   = live_en or (0 < game_time <= now)
+        is_live   = (0 < game_time <= now)
 
         evento = f"{mkt.get('teamOneName','?')} vs {mkt.get('teamTwoName','?')}"
         side   = mkt.get("outcomeOneName","O1") if g["betting_outcome_one"] else mkt.get("outcomeTwoName","O2")
@@ -645,16 +645,15 @@ async def cmd_debuglive(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         lines = ["🔍 *Debug campos LIVE*\n"]
         for mh, mkt in markets.items():
             gt      = mkt.get("gameTime", 0) or 0
-            live_en = mkt.get("liveEnabled", False)
             s1      = mkt.get("teamOneScore", "?")
             s2      = mkt.get("teamTwoScore", "?")
-            is_live = live_en or (0 < gt <= now)
+            is_live = (0 < gt <= now)
             evento  = f"{mkt.get('teamOneName','?')} vs {mkt.get('teamTwoName','?')}"
             from datetime import datetime, timezone as tz
             gt_str  = datetime.fromtimestamp(gt, tz=tz.utc).strftime("%d/%m %H:%M") if gt else "0"
             lines.append(
                 f"{'🔴' if is_live else '⏳'} {_escape(evento)}\n"
-                f"   gameTime: `{_escape(gt_str)}` liveEnabled: `{live_en}` score: `{s1}-{s2}`"
+                f"   gameTime: `{_escape(gt_str)}` score: `{s1}-{s2}`"
             )
         await msg.edit_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2)
     except Exception as e:
