@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 load_dotenv()  # carga variables desde .env si existe
 
-VERSION = "1.7.1"
+VERSION = "1.7.2"
 VERSION_DATE = "2026-02-10"
 VERSION_NOTES = [
     "✅ Detección de surebets en apuestas activas",
@@ -28,6 +28,7 @@ VERSION_NOTES = [
     "✅ Estadísticas incluyen surebets cerradas y ROI medio",
     "✅ Recomendación de stake y cuota mínima en /activas para cada apuesta",
     "✅ Fix: detección LIVE basada solo en gameTime, no en liveEnabled",
+    "✅ Fix: wallet address sin .lower() — SX.bet requiere checksum format",
 ]
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
