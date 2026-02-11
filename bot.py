@@ -11,19 +11,19 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 load_dotenv()  # carga variables desde .env si existe
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 VERSION_DATE = "2026-02-11"
 VERSION_NOTES = [
-    "✅ NUEVO: AutoBet — cierra surebets automáticamente con clave privada",
-    "✅ NUEVO: /autobet_on / /autobet_off — activar/desactivar autobet",
-    "✅ NUEVO: /autobet_status — ver estado y último resultado",
+    "✅ NUEVO: Verificación de balance USDC antes de cada autobet",
+    "✅ NUEVO: Stake de cobertura se reduce automáticamente si no hay saldo suficiente",
+    "✅ NUEVO: /saldo — ver balance disponible en tiempo real",
+    "✅ AutoBet — cierra surebets automáticamente con clave privada",
+    "✅ /autobet_on / /autobet_off — activar/desactivar autobet",
     "✅ Detección de surebets en apuestas activas",
     "✅ Monitor automático con doble intervalo (órdenes / trades)",
     "✅ Detección de partidos en LIVE con marcador en /activas",
     "✅ /setroi — ROI mínimo configurable desde Telegram",
     "✅ SUREBET CONSEGUIDA: detecta ambas patas y deja de notificar",
-    "✅ Recomendación de stake y cuota mínima en /activas",
-    "✅ Fix: wallet address sin .lower() — SX.bet requiere checksum format",
 ]
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -170,7 +170,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "🤖 *AutoBet \\(contra\\-apuesta automática\\):*\n"
         "▶️ /autobet\\_on — Activar cierre automático\n"
         "⏸ /autobet\\_off — Desactivar autobet\n"
-        "📋 /autobet\\_status — Ver estado y últimas ejecuciones\n\n"
+        "📋 /autobet\\_status — Ver estado y últimas ejecuciones\n"
+        "💰 /saldo — Ver balance USDC en wallet\n\n"
         "🔢 /version — Versión del bot\n"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2)
@@ -364,16 +365,53 @@ async def cmd_autobet_off(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏸ *AutoBet DESACTIVADO*\\. Solo recibirás alertas\\.", parse_mode=ParseMode.MARKDOWN_V2)
 
 
+async def cmd_saldo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Muestra el balance USDC actual de la wallet."""
+    if not auth(update): return
+    if not autobet_engine:
+        await update.message.reply_text("❌ AutoBet no está configurado \\(falta PRIVATE\\_KEY\\)\\.", parse_mode=ParseMode.MARKDOWN_V2)
+        return
+    msg = await update.message.reply_text("💰 Consultando balance…")
+    try:
+        balance = await asyncio.to_thread(autobet_engine.get_usdc_balance)
+        if balance < 0:
+            await msg.edit_text("❌ No se pudo leer el balance on\\-chain\\. Verifica la conexión\\.", parse_mode=ParseMode.MARKDOWN_V2)
+            return
+        from autobet import BALANCE_RESERVE, TAKER_MIN_USDC
+        available = balance - BALANCE_RESERVE
+        status = "🟢 Suficiente" if available >= TAKER_MIN_USDC else "🔴 Insuficiente para apostar"
+        await msg.edit_text(
+            f"💰 *Saldo USDC en wallet*\n\n"
+            f"Total: `{balance:.2f}` USDC\n"
+            f"Reserva mínima: `{BALANCE_RESERVE:.0f}` USDC\n"
+            f"Disponible para apostar: `{available:.2f}` USDC\n"
+            f"Estado: {status}",
+            parse_mode=ParseMode.MARKDOWN_V2
+        )
+    except Exception as e:
+        await msg.edit_text(f"❌ Error: {_escape(str(e))}", parse_mode=ParseMode.MARKDOWN_V2)
+
+
 async def cmd_autobet_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not auth(update): return
     engine_ok = autobet_engine is not None
     status    = "🟢 ACTIVADO" if AUTO_BET_ENABLED else "🔴 DESACTIVADO"
+
+    # Leer balance si hay engine
+    balance_line = ""
+    if autobet_engine:
+        bal = await asyncio.to_thread(autobet_engine.get_usdc_balance)
+        if bal >= 0:
+            from autobet import BALANCE_RESERVE
+            avail = bal - BALANCE_RESERVE
+            balance_line = f"\nSaldo: `{bal:.2f}` USDC \\(disponible: `{avail:.2f}`\\)"
+
     lines = [
         "🤖 *Estado AutoBet*\n",
         f"Estado: {status}",
         f"Clave privada: {'✅ Configurada' if PRIVATE_KEY else '❌ No configurada'}",
         f"Engine: {'✅ OK' if engine_ok else '❌ Error de inicialización'}",
-        f"ROI mínimo para disparar: `{MIN_ROI:.1f}%`",
+        f"ROI mínimo para disparar: `{MIN_ROI:.1f}%`" + balance_line,
         "",
         f"*Últimas ejecuciones: {len(_autobet_log)}*",
     ]
@@ -876,6 +914,7 @@ def main():
     app.add_handler(CommandHandler("autobet_on",     cmd_autobet_on))
     app.add_handler(CommandHandler("autobet_off",    cmd_autobet_off))
     app.add_handler(CommandHandler("autobet_status", cmd_autobet_status))
+    app.add_handler(CommandHandler("saldo",          cmd_saldo))
     app.add_handler(CommandHandler("debuglive",      cmd_debuglive))
     app.add_handler(CommandHandler("debugwallet",    cmd_debugwallet))
     app.add_handler(CommandHandler("debugtrades",    cmd_debugtrades))

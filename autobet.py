@@ -41,6 +41,23 @@ AFFILIATE_ADDRESS = "0x0000000000000000000000000000000000000000"
 # Stake mínimo que acepta SX.bet (5 USDC ~ safe)
 TAKER_MIN_USDC    = 5.0
 
+# Reserva mínima que siempre dejar en la wallet (no gastar todo)
+BALANCE_RESERVE   = 2.0   # USDC
+
+# RPC de SX Rollup
+SX_RPC            = "https://rpc.sx-rollup.gelato.digital"
+
+# ABI mínimo USDC (balanceOf + allowance)
+USDC_ABI = [
+    {"inputs": [{"name": "account", "type": "address"}],
+     "name": "balanceOf", "outputs": [{"name": "", "type": "uint256"}],
+     "stateMutability": "view", "type": "function"},
+    {"inputs": [{"name": "owner",   "type": "address"},
+                {"name": "spender", "type": "address"}],
+     "name": "allowance", "outputs": [{"name": "", "type": "uint256"}],
+     "stateMutability": "view", "type": "function"},
+]
+
 
 # ─────────────────────────────────────────────────────────────
 #  CLASE PRINCIPAL
@@ -85,6 +102,27 @@ class AutoBetEngine:
             addr_bytes = bytes.fromhex(EIP712_FILL_HASHER[2:])  # 20 bytes
             self._domain_salt = Web3.keccak(addr_bytes)
         return self._domain_salt
+
+    # ── Balance USDC ─────────────────────────────────────────
+
+    def get_usdc_balance(self) -> float:
+        """
+        Lee el balance de USDC on-chain en SX Rollup.
+        Retorna el importe en USDC (float). -1 si hay error.
+        """
+        try:
+            w3   = Web3(Web3.HTTPProvider(SX_RPC, request_kwargs={"timeout": 8}))
+            usdc = w3.eth.contract(
+                address=Web3.to_checksum_address(USDC_ADDRESS),
+                abi=USDC_ABI
+            )
+            raw = usdc.functions.balanceOf(
+                Web3.to_checksum_address(self.wallet)
+            ).call()
+            return raw / USDC_SCALE
+        except Exception as e:
+            log.warning(f"get_usdc_balance error: {e}")
+            return -1.0
 
     # ── Órdenes disponibles ──────────────────────────────────
 
@@ -220,6 +258,26 @@ class AutoBetEngine:
                            f"está por debajo del mínimo ({TAKER_MIN_USDC} USDC)."
             }
 
+        # 0. Verificar balance disponible
+        balance = self.get_usdc_balance()
+        if balance < 0:
+            log.warning("No se pudo verificar balance — continuando igualmente")
+        else:
+            available = balance - BALANCE_RESERVE
+            if available < TAKER_MIN_USDC:
+                return {
+                    "success": False,
+                    "message": f"Saldo insuficiente: {balance:.2f} USDC en wallet "
+                               f"(reserva {BALANCE_RESERVE:.0f} USDC → disponible {available:.2f} USDC).",
+                    "balance": balance,
+                }
+            if hedge_stake_usdc > available:
+                log.info(
+                    f"Stake de cobertura reducido: {hedge_stake_usdc:.2f} → {available:.2f} USDC "
+                    f"(balance {balance:.2f} - reserva {BALANCE_RESERVE:.0f})"
+                )
+                hedge_stake_usdc = available
+
         # 1. Obtener mejores órdenes disponibles
         orders = self.get_best_orders(market_hash, betting_outcome_one)
         if not orders:
@@ -246,6 +304,9 @@ class AutoBetEngine:
                 "success": False,
                 "message": f"Liquidez insuficiente en la orden (solo {best['fillable_usdc']:.2f} USDC disponibles)."
             }
+
+        # Avisar si hubo reducción de stake respecto al ideal
+        stake_reduced = actual_stake < hedge_stake_usdc - 0.01
 
         # 4. Convertir a raw
         taker_amount_raw = int(actual_stake * USDC_SCALE)
@@ -294,13 +355,17 @@ class AutoBetEngine:
             log.info(f"AutoBet response: {body}")
 
             if r.status_code == 200 and body.get("status") == "success":
+                msg = "✅ Contra-apuesta ejecutada correctamente."
+                if stake_reduced:
+                    msg += f" ⚠️ Stake reducido por saldo limitado (ideal: {hedge_stake_usdc:.2f} USDC)."
                 return {
-                    "success":     True,
-                    "message":     "✅ Contra-apuesta ejecutada correctamente.",
-                    "stake":       actual_stake,
-                    "odds":        best["taker_odds"],
-                    "order_hash":  best["orderHash"],
-                    "http_status": r.status_code,
+                    "success":       True,
+                    "message":       msg,
+                    "stake":         actual_stake,
+                    "odds":          best["taker_odds"],
+                    "order_hash":    best["orderHash"],
+                    "stake_reduced": stake_reduced,
+                    "http_status":   r.status_code,
                 }
             else:
                 err = body.get("message") or body.get("error") or str(body)
