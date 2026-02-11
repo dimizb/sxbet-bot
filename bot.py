@@ -11,23 +11,18 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 load_dotenv()  # carga variables desde .env si existe
 
-VERSION = "1.7.5"
-VERSION_DATE = "2026-02-10"
+VERSION = "2.0.0"
+VERSION_DATE = "2026-02-11"
 VERSION_NOTES = [
+    "✅ NUEVO: AutoBet — cierra surebets automáticamente con clave privada",
+    "✅ NUEVO: /autobet_on / /autobet_off — activar/desactivar autobet",
+    "✅ NUEVO: /autobet_status — ver estado y último resultado",
     "✅ Detección de surebets en apuestas activas",
     "✅ Monitor automático con doble intervalo (órdenes / trades)",
-    "✅ Caché inteligente: órdenes cada Xs, trades cada 60s",
-    "✅ Detección automática de rate limit 429",
-    "✅ Comandos: /surebets /activas /stats /historial /estado /version",
-    "✅ Soporte para múltiples Chat IDs (TELEGRAM_CHAT_ID separados por coma)",
     "✅ Detección de partidos en LIVE con marcador en /activas",
     "✅ /setroi — ROI mínimo configurable desde Telegram",
-    "✅ MIN_ROI como variable de entorno (default 1%)",
-    "✅ Fix: /activas ahora detecta correctamente partidos en LIVE",
     "✅ SUREBET CONSEGUIDA: detecta ambas patas y deja de notificar",
-    "✅ Estadísticas incluyen surebets cerradas y ROI medio",
-    "✅ Recomendación de stake y cuota mínima en /activas para cada apuesta",
-    "✅ Fix: detección LIVE basada solo en gameTime, no en liveEnabled",
+    "✅ Recomendación de stake y cuota mínima en /activas",
     "✅ Fix: wallet address sin .lower() — SX.bet requiere checksum format",
 ]
 
@@ -38,6 +33,7 @@ from telegram.ext import (
 from telegram.constants import ParseMode
 
 from sxbet import SXBetClient, find_surebets, get_stats, get_stats_with_markets, detect_closed_surebets
+from autobet import AutoBetEngine
 
 # ─────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -55,6 +51,7 @@ TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 ALLOWED_CHATS = set(int(x.strip()) for x in os.environ["TELEGRAM_CHAT_ID"].split(","))
 SX_API_KEY       = os.environ["SX_API_KEY"]
 SX_WALLET        = os.environ["SX_WALLET"]
+PRIVATE_KEY      = os.getenv("PRIVATE_KEY", "")   # clave privada para autobet
 
 # Intervalos de escaneo independientes:
 # - ORDERS_INTERVAL: cada cuántos segundos pide las cuotas live (puede ser 5s)
@@ -65,12 +62,29 @@ MIN_ROI         = float(os.getenv("MIN_ROI", "1.0").replace(",", "."))  # % ROI 
 
 client = SXBetClient(api_key=SX_API_KEY, wallet=SX_WALLET)
 
+# ── AutoBet Engine ────────────────────────────────────────────
+autobet_engine: AutoBetEngine = None
+AUTO_BET_ENABLED = False
+
+if PRIVATE_KEY:
+    try:
+        autobet_engine  = AutoBetEngine(SX_API_KEY, PRIVATE_KEY, SX_WALLET)
+        AUTO_BET_ENABLED = True
+        log.info("✅ AutoBet Engine inicializado correctamente")
+    except Exception as _e:
+        log.error(f"❌ Error inicializando AutoBet: {_e}")
+else:
+    log.info("ℹ️ PRIVATE_KEY no configurada — autobet desactivado")
+
 # ── Cache en memoria ──────────────────────────────────────────
 _cache = {
     "groups":   [],      # apuestas activas agrupadas
     "markets":  {},      # datos de mercado
     "last_trades_fetch": 0,
 }
+
+# Resultados del autobet (para /autobet_status)
+_autobet_log: list = []   # lista de dicts con resultado de cada ejecución
 
 # ─────────────────────────────────────────────────────────────
 #  HELPERS
@@ -152,8 +166,12 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "🔔 /monitor\\_on — Activar alertas automáticas\n"
         "🔕 /monitor\\_off — Desactivar alertas\n"
         "ℹ️ /estado — Estado del monitor\n"
+        "📊 /setroi — Ver o cambiar ROI mínimo\n\n"
+        "🤖 *AutoBet \\(contra\\-apuesta automática\\):*\n"
+        "▶️ /autobet\\_on — Activar cierre automático\n"
+        "⏸ /autobet\\_off — Desactivar autobet\n"
+        "📋 /autobet\\_status — Ver estado y últimas ejecuciones\n\n"
         "🔢 /version — Versión del bot\n"
-        "📊 /setroi — Ver o cambiar ROI mínimo\n"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2)
 
@@ -272,7 +290,15 @@ async def _monitor_job(ctx: ContextTypes.DEFAULT_TYPE):
                 continue  # ya avisamos de esta
             _notified.add(key)
 
-            text = _format_surebet_alert(sb)
+            # ── AutoBet: ejecutar contra-apuesta automáticamente ──
+            autobet_result = None
+            if AUTO_BET_ENABLED and autobet_engine:
+                autobet_result = await asyncio.to_thread(
+                    _execute_hedge, sb
+                )
+
+            # ── Notificación Telegram ─────────────────────────────
+            text = _format_surebet_alert(sb, autobet_result=autobet_result)
             keyboard = InlineKeyboardMarkup([[
                 InlineKeyboardButton("📊 Ver todas", callback_data="cmd_surebets"),
                 InlineKeyboardButton("📋 Activas",   callback_data="cmd_activas"),
@@ -306,9 +332,107 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         result = await asyncio.to_thread(_get_activas)
         await query.message.reply_text(result, parse_mode=ParseMode.MARKDOWN_V2)
 
+
+# ─────────────────────────────────────────────────────────────
+#  AUTOBET COMMANDS
+# ─────────────────────────────────────────────────────────────
+
+async def cmd_autobet_on(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not auth(update): return
+    global AUTO_BET_ENABLED
+    if not autobet_engine:
+        await update.message.reply_text(
+            "❌ No se puede activar AutoBet\\.\n"
+            "Asegúrate de haber configurado `PRIVATE_KEY` en Railway y reiniciar el bot\\.",
+            parse_mode=ParseMode.MARKDOWN_V2
+        )
+        return
+    AUTO_BET_ENABLED = True
+    await update.message.reply_text(
+        "🤖 *AutoBet ACTIVADO*\n\n"
+        "Cuando el monitor detecte una surebet con ROI ≥ `" + str(MIN_ROI) + "%`, "
+        "ejecutaré la contra\\-apuesta automáticamente\\.\n\n"
+        "⚠️ Asegúrate de tener saldo USDC suficiente en tu wallet\\.",
+        parse_mode=ParseMode.MARKDOWN_V2
+    )
+
+
+async def cmd_autobet_off(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not auth(update): return
+    global AUTO_BET_ENABLED
+    AUTO_BET_ENABLED = False
+    await update.message.reply_text("⏸ *AutoBet DESACTIVADO*\\. Solo recibirás alertas\\.", parse_mode=ParseMode.MARKDOWN_V2)
+
+
+async def cmd_autobet_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not auth(update): return
+    engine_ok = autobet_engine is not None
+    status    = "🟢 ACTIVADO" if AUTO_BET_ENABLED else "🔴 DESACTIVADO"
+    lines = [
+        "🤖 *Estado AutoBet*\n",
+        f"Estado: {status}",
+        f"Clave privada: {'✅ Configurada' if PRIVATE_KEY else '❌ No configurada'}",
+        f"Engine: {'✅ OK' if engine_ok else '❌ Error de inicialización'}",
+        f"ROI mínimo para disparar: `{MIN_ROI:.1f}%`",
+        "",
+        f"*Últimas ejecuciones: {len(_autobet_log)}*",
+    ]
+    for entry in reversed(_autobet_log[-5:]):
+        icon = "✅" if entry["success"] else "❌"
+        lines.append(
+            f"{icon} `{entry['time']}` — {_escape(entry['event'])}\n"
+            f"   {_escape(entry['msg'])}"
+        )
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2)
+
 # ─────────────────────────────────────────────────────────────
 #  FUNCIONES SÍNCRONAS (se ejecutan en thread pool)
 # ─────────────────────────────────────────────────────────────
+
+def _execute_hedge(sb: dict) -> dict:
+    """
+    Ejecuta la contra-apuesta para cerrar la surebet.
+    Se llama desde el monitor cuando se detecta una nueva surebet.
+    Retorna dict con result para incluir en la notificación.
+    """
+    try:
+        mkt     = _cache["markets"].get(sb["market_hash"], {})
+        event   = sb["event"]
+        # La apuesta original es en sb["betting_outcome_one"]
+        # La cobertura va al lado contrario
+        orig_side = sb.get("betting_outcome_one", True)   # True si apostamos O1
+        hedge_side = not orig_side                          # Cubrir con el lado contrario
+
+        hedge_stake  = sb["hedge_stake"]
+        min_odds_req = sb.get("live_opp_odds", 1.01)   # cuota mínima para que tenga sentido
+
+        result = autobet_engine.place_hedge(
+            market_hash         = sb["market_hash"],
+            betting_outcome_one = hedge_side,
+            hedge_stake_usdc    = hedge_stake,
+            min_odds            = min_odds_req * 0.98,   # margen 2% por deslizamiento
+        )
+
+        result["event"] = event
+        result["time"]  = datetime.now().strftime("%d/%m %H:%M")
+
+        _autobet_log.append({
+            "success": result["success"],
+            "event":   event,
+            "time":    result["time"],
+            "msg":     result["message"],
+        })
+
+        # Mantener solo los últimos 50 en memoria
+        if len(_autobet_log) > 50:
+            _autobet_log.pop(0)
+
+        log.info(f"AutoBet result: {result}")
+        return result
+
+    except Exception as e:
+        log.error(f"_execute_hedge error: {e}")
+        return {"success": False, "message": str(e), "event": sb.get("event","?"), "time": datetime.now().strftime("%d/%m %H:%M")}
 
 def _refresh_trades_cache():
     """Actualiza el caché de trades y mercados (operación pesada, hacerla poco frecuente)."""
@@ -588,7 +712,7 @@ def _escape(s: str) -> str:
     return str(s).translate(_ESC)
 
 
-def _format_surebet_alert(sb: dict, compact: bool = False) -> str:
+def _format_surebet_alert(sb: dict, compact: bool = False, autobet_result: dict = None) -> str:
     roi    = sb["roi"]
     profit = sb["guaranteed_profit"]
     event  = sb["event"]
@@ -604,11 +728,26 @@ def _format_surebet_alert(sb: dict, compact: bool = False) -> str:
     is_live   = sb.get("is_live", False)
     live_badge = "🔴 LIVE — " if is_live else ""
 
+    # Línea de resultado autobet
+    if autobet_result is not None:
+        if autobet_result.get("success"):
+            actual_stake = autobet_result.get("stake", hedge)
+            actual_odds  = autobet_result.get("odds", odd_opp)
+            autobet_line = (
+                f"\n🤖 *AutoBet EJECUTADO:* `{actual_stake:.2f}` USDC @ `{actual_odds:.3f}`"
+            )
+        else:
+            err = _escape(autobet_result.get("message", "Error desconocido"))
+            autobet_line = f"\n🤖 *AutoBet FALLÓ:* {err}"
+    else:
+        autobet_line = ""
+
     if compact:
         return (
             f"{roi_e} {live_badge}*{_escape(event)}*\n"
             f"   {_escape(side)} @ `{odd_orig:.3f}` → cubrir `{hedge:.2f}` USDC @ `{odd_opp:.3f}`\n"
             f"   💰 Beneficio garantizado: *`{profit:+.2f}` USDC* \\({roi:+.1f}%\\)\n"
+            + autobet_line
         )
 
     live_line = "🔴 *PARTIDO EN LIVE*\n" if is_live else ""
@@ -623,8 +762,9 @@ def _format_surebet_alert(sb: dict, compact: bool = False) -> str:
         f"🔄 *Apuesta de cobertura \\(lado contrario\\):*\n"
         f"   Stake: `{hedge:.2f}` USDC @ cuota `{odd_opp:.3f}`\n\n"
         f"💰 *Beneficio garantizado: `{profit:+.2f}` USDC*\n"
-        f"📈 ROI: `{roi:+.2f}%`\n\n"
-        f"⏰ {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"
+        f"📈 ROI: `{roi:+.2f}%`"
+        + autobet_line
+        + f"\n\n⏰ {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"
     )
 
 
@@ -723,19 +863,22 @@ def main():
         .build()
     )
 
-    app.add_handler(CommandHandler("start",       cmd_start))
-    app.add_handler(CommandHandler("surebets",    cmd_surebets))
-    app.add_handler(CommandHandler("activas",     cmd_activas))
-    app.add_handler(CommandHandler("stats",       cmd_stats))
-    app.add_handler(CommandHandler("historial",   cmd_historial))
-    app.add_handler(CommandHandler("monitor_on",  cmd_monitor_on))
-    app.add_handler(CommandHandler("monitor_off", cmd_monitor_off))
-    app.add_handler(CommandHandler("estado",      cmd_estado))
-    app.add_handler(CommandHandler("version",     cmd_version))
-    app.add_handler(CommandHandler("setroi",      cmd_setroi))
-    app.add_handler(CommandHandler("debuglive",   cmd_debuglive))
-    app.add_handler(CommandHandler("debugwallet",  cmd_debugwallet))
-    app.add_handler(CommandHandler("debugtrades",  cmd_debugtrades))
+    app.add_handler(CommandHandler("start",          cmd_start))
+    app.add_handler(CommandHandler("surebets",       cmd_surebets))
+    app.add_handler(CommandHandler("activas",        cmd_activas))
+    app.add_handler(CommandHandler("stats",          cmd_stats))
+    app.add_handler(CommandHandler("historial",      cmd_historial))
+    app.add_handler(CommandHandler("monitor_on",     cmd_monitor_on))
+    app.add_handler(CommandHandler("monitor_off",    cmd_monitor_off))
+    app.add_handler(CommandHandler("estado",         cmd_estado))
+    app.add_handler(CommandHandler("version",        cmd_version))
+    app.add_handler(CommandHandler("setroi",         cmd_setroi))
+    app.add_handler(CommandHandler("autobet_on",     cmd_autobet_on))
+    app.add_handler(CommandHandler("autobet_off",    cmd_autobet_off))
+    app.add_handler(CommandHandler("autobet_status", cmd_autobet_status))
+    app.add_handler(CommandHandler("debuglive",      cmd_debuglive))
+    app.add_handler(CommandHandler("debugwallet",    cmd_debugwallet))
+    app.add_handler(CommandHandler("debugtrades",    cmd_debugtrades))
     app.add_handler(CallbackQueryHandler(callback_handler))
 
     log.info("Bot iniciado ✅")

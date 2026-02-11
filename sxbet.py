@@ -312,21 +312,22 @@ def find_surebets(groups: list, markets: dict, orders: dict, min_roi: float = 0.
                else mkt.get("outcomeTwoName", "O2")
 
         surebets.append({
-            "stable_key":        g["stable_key"],
-            "market_hash":       g["market_hash"],
-            "event":             f"{mkt.get('teamOneName','?')} vs {mkt.get('teamTwoName','?')}",
-            "sport":             mkt.get("sportLabel", "?"),
-            "league":            mkt.get("leagueLabel", "?"),
-            "market_type":       _market_type(mkt.get("type"), mkt.get("line")),
-            "side":              side,
-            "total_stake":       g["total_stake"],
-            "avg_odds":          g["avg_odds"],
-            "potential_win":     potential,
-            "live_same_odds":    live_same,
-            "live_opp_odds":     live_opp,
-            "hedge_stake":       hedge,
-            "guaranteed_profit": guaranteed,
-            "roi":               roi,
+            "stable_key":          g["stable_key"],
+            "market_hash":         g["market_hash"],
+            "event":               f"{mkt.get('teamOneName','?')} vs {mkt.get('teamTwoName','?')}",
+            "sport":               mkt.get("sportLabel", "?"),
+            "league":              mkt.get("leagueLabel", "?"),
+            "market_type":         _market_type(mkt.get("type"), mkt.get("line")),
+            "side":                side,
+            "betting_outcome_one": g["betting_outcome_one"],   # True = apostamos O1
+            "total_stake":         g["total_stake"],
+            "avg_odds":            g["avg_odds"],
+            "potential_win":       potential,
+            "live_same_odds":      live_same,
+            "live_opp_odds":       live_opp,
+            "hedge_stake":         hedge,
+            "guaranteed_profit":   guaranteed,
+            "roi":                 roi,
         })
 
     surebets.sort(key=lambda x: x["roi"], reverse=True)
