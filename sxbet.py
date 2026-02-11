@@ -36,7 +36,7 @@ MARKET_NAMES = {
 class SXBetClient:
     def __init__(self, api_key: str, wallet: str):
         # SX.bet API requires EIP-55 checksum addresses — do NOT lowercase
-        self.wallet = wallet.strip()
+        self.wallet = wallet.strip()  # IMPORTANT: use exact checksum format from SX.bet
         self.session = requests.Session()
         self.session.headers.update({
             "X-Api-Key":    api_key,

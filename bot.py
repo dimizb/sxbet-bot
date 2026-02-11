@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 load_dotenv()  # carga variables desde .env si existe
 
-VERSION = "1.7.2"
+VERSION = "1.7.4"
 VERSION_DATE = "2026-02-10"
 VERSION_NOTES = [
     "✅ Detección de surebets en apuestas activas",
@@ -632,6 +632,50 @@ def _format_surebet_alert(sb: dict, compact: bool = False) -> str:
 #  MAIN
 # ─────────────────────────────────────────────────────────────
 
+async def cmd_debugtrades(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Muestra respuesta cruda de la API de trades para diagnosticar el problema."""
+    if not auth(update): return
+    msg = await update.message.reply_text("🔍 Consultando API directamente...")
+    try:
+        import requests as _req
+        wallet = client.wallet
+        url = "https://api.sx.bet/trades?bettor=" + wallet + "&settled=false&pageSize=5"
+        headers = {"X-Api-Key": client.api_key} if client.api_key else {}
+        r = _req.get(url, headers=headers, timeout=10)
+        data = r.json()
+        trades = data.get("data", {}).get("trades", [])
+        api_status = data.get("status", "?")
+        lines = [
+            "🔍 *Debug API trades*",
+            "",
+            "Wallet: `" + _escape(wallet[:16]) + "\\.\\.\\.\`",
+            "HTTP: `" + str(r.status_code) + "`",
+            "API status: `" + _escape(api_status) + "`",
+            "Trades activos: `" + str(len(trades)) + "`",
+        ]
+        if not trades:
+            lines.append("")
+            lines.append("⚠️ API devuelve 0 trades")
+            lines.append("Verifica `SX\\_WALLET` en Railway")
+            lines.append("Debe tener mayúsculas/minúsculas exactas")
+        await msg.edit_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2)
+    except Exception as e:
+        await msg.edit_text("❌ Error: " + _escape(str(e)), parse_mode=ParseMode.MARKDOWN_V2)
+
+
+async def cmd_debugwallet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Muestra la wallet que usa el bot para verificar que coincide con SX.bet."""
+    if not auth(update): return
+    wallet = client.wallet
+    short  = f"{wallet[:8]}...{wallet[-6:]}" if len(wallet) > 14 else wallet
+    await update.message.reply_text(
+        f"🔑 *Wallet configurada en el bot:*\n`{_escape(wallet)}`\n\n"
+        "Verifica que coincide exactamente con la que ves en SX\\.bet → Account → Overview\n"
+        "\\(incluyendo mayúsculas y minúsculas\\)",
+        parse_mode=ParseMode.MARKDOWN_V2
+    )
+
+
 async def cmd_debuglive(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Muestra los campos live de todos los mercados activos para diagnóstico."""
     if not auth(update): return
@@ -679,6 +723,8 @@ def main():
     app.add_handler(CommandHandler("version",     cmd_version))
     app.add_handler(CommandHandler("setroi",      cmd_setroi))
     app.add_handler(CommandHandler("debuglive",   cmd_debuglive))
+    app.add_handler(CommandHandler("debugwallet",  cmd_debugwallet))
+    app.add_handler(CommandHandler("debugtrades",  cmd_debugtrades))
     app.add_handler(CallbackQueryHandler(callback_handler))
 
     log.info("Bot iniciado ✅")
