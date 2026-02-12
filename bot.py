@@ -11,17 +11,16 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 load_dotenv()  # carga variables desde .env si existe
 
-VERSION = "2.3.0"
-VERSION_DATE = "2026-02-11"
+VERSION = "2.5.0"
+VERSION_DATE = "2026-02-12"
 VERSION_NOTES = [
-    "✅ NUEVO: Marcadores en vivo en alertas de surebet (ej: '🔴 6-4, 3-2 (Set 2)')",
-    "✅ NUEVO: fetch_active_markets() — método robusto para obtener mercados",
-    "✅ NUEVO: fetch_live_score() — obtiene marcadores en tiempo real",
-    "✅ FIX: /analisis ahora funciona correctamente (reescrito desde cero)",
-    "✅ Análisis pre-partido con score de 100 puntos",
-    "✅ AutoBet reintenta 3 veces si no hay órdenes disponibles",
+    "✅ NUEVO: Órdenes LIMIT automáticas cuando no hay órdenes en el orderbook",
+    "✅ NUEVO: Fallback a LIMIT si cuota disponible < mínimo requerido",
+    "✅ FIX: /analisis completamente reescrito — filtra pre-partido antes de pedir órdenes",
+    "✅ FIX: fetch_active_markets con logging detallado para debug",
+    "✅ Notificación diferenciada: TAKER ejecutado vs LIMIT publicado",
+    "✅ Marcadores en vivo en alertas de surebet",
     "✅ Verificación de balance USDC antes de cada autobet",
-    "✅ /saldo — ver balance disponible en tiempo real",
     "✅ AutoBet — cierra surebets automáticamente con clave privada",
 ]
 
@@ -322,18 +321,54 @@ async def _monitor_job(ctx: ContextTypes.DEFAULT_TYPE):
                 )
 
             # ── Notificación Telegram ─────────────────────────────
-            text = _format_surebet_alert(sb, autobet_result=autobet_result)
-            keyboard = InlineKeyboardMarkup([[
+            mkt_hash = sb["market_hash"]
+            sx_url   = f"https://sx.bet/market/{mkt_hash}"
+
+            # Botones: siempre "Ver todas" y "Activas", + link directo si autobet falló
+            btn_row = [
                 InlineKeyboardButton("📊 Ver todas", callback_data="cmd_surebets"),
                 InlineKeyboardButton("📋 Activas",   callback_data="cmd_activas"),
-            ]])
+            ]
+            if autobet_result and not autobet_result.get("success"):
+                btn_row2 = [InlineKeyboardButton("⚡ APOSTAR AHORA en SX.bet", url=sx_url)]
+                keyboard = InlineKeyboardMarkup([btn_row, btn_row2])
+            else:
+                keyboard = InlineKeyboardMarkup([btn_row])
+
+            text = _format_surebet_alert(sb, autobet_result=autobet_result)
+
             for _cid in ALLOWED_CHATS:
-              await ctx.bot.send_message(
-                chat_id=_cid,
-                text=text,
-                parse_mode=ParseMode.MARKDOWN_V2,
-                reply_markup=keyboard
-              )
+                await ctx.bot.send_message(
+                    chat_id=_cid,
+                    text=text,
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                    reply_markup=keyboard
+                )
+
+            # ── Notificación urgente separada si falló por saldo ──
+            if autobet_result and not autobet_result.get("success"):
+                msg = autobet_result.get("message", "")
+                if "Saldo insuficiente" in msg or "insuficiente" in msg.lower():
+                    bal = autobet_result.get("balance", 0)
+                    hedge = sb.get("hedge_stake", 0)
+                    urgente = (
+                        f"⚠️ *ACCIÓN REQUERIDA*\n\n"
+                        f"AutoBet falló por *saldo insuficiente*\\.\n\n"
+                        f"💰 Saldo actual: `{bal:.2f}` USDC\n"
+                        f"📌 Necesario: `{hedge:.2f}` USDC\n"
+                        f"❌ Faltan: `{max(0, hedge-bal):.2f}` USDC\n\n"
+                        f"👉 *Apuesta manualmente antes de que cambie la cuota:*"
+                    )
+                    urgent_kb = InlineKeyboardMarkup([[
+                        InlineKeyboardButton("⚡ APOSTAR AHORA", url=sx_url)
+                    ]])
+                    for _cid in ALLOWED_CHATS:
+                        await ctx.bot.send_message(
+                            chat_id=_cid,
+                            text=urgente,
+                            parse_mode=ParseMode.MARKDOWN_V2,
+                            reply_markup=urgent_kb
+                        )
 
         # Limpiar notificaciones de surebets que ya no existen
         current_keys = {sb["stable_key"] for sb in surebets}
@@ -765,43 +800,60 @@ def _get_activas() -> str:
 def _get_analisis() -> str:
     """Analiza mercados pre-partido y devuelve recomendaciones."""
     try:
-        # Obtener mercados activos usando el cliente
+        import time as _t
         log.info("Fetching active markets for analysis...")
         markets_dict = client.fetch_active_markets(limit=150)
         
         if not markets_dict:
             return (
-                "❌ No hay mercados disponibles\\.\n\n"
-                "Esto puede deberse a:\n"
-                "• Problemas con la API de SX\\.bet\n"
-                "• No hay partidos programados\n"
-                "• Verifica los logs del bot"
+                "📊 *Análisis Pre\\-Partido*\n\n"
+                "❌ No se pudieron obtener mercados\\.\n\n"
+                "Posibles causas:\n"
+                "• Rate limit de la API \\(espera 30s e intenta de nuevo\\)\n"
+                "• La API de SX\\.bet está respondiendo diferente\n"
+                "• Revisa los logs del bot para ver el error exacto"
             )
         
-        log.info(f"Analyzing {len(markets_dict)} markets")
+        log.info(f"Got {len(markets_dict)} markets")
         
-        # Obtener órdenes (limitar a primeros 100 para no sobrecargar)
-        hashes = list(markets_dict.keys())[:100]
+        # Filtrar solo pre-partido (gameTime en el futuro)
+        now = _t.time()
+        prematch = {
+            mh: mkt for mh, mkt in markets_dict.items()
+            if isinstance(mkt, dict) and (mkt.get("gameTime") or 0) > now
+        }
+        
+        if not prematch:
+            live_count = sum(1 for mkt in markets_dict.values()
+                             if isinstance(mkt, dict) and 0 < (mkt.get("gameTime") or 0) <= now)
+            return (
+                f"📊 *Análisis Pre\\-Partido*\n\n"
+                f"Escaneados `{len(markets_dict)}` mercados totales\\.\n"
+                f"🔴 En LIVE ahora: `{live_count}`\n"
+                f"⏳ Pre\\-partido: `0`\n\n"
+                f"No hay partidos programados en las próximas 6h\\.\n"
+                f"💡 Intenta de nuevo más tarde\\."
+            )
+        
+        # Obtener órdenes solo pre-partido (max 80 para no sobrecargar)
+        hashes = list(prematch.keys())[:80]
         all_orders = client.fetch_orders(hashes)
-        
-        log.info(f"Fetched orders for {len(all_orders)} markets")
+        log.info(f"Orders fetched for {len(all_orders)} pre-match markets")
         
         # Analizar
         opps = analyze_prematches(markets_dict, all_orders, min_roi=MIN_ROI)
         
         if not opps:
             return (
-                "📊 *Análisis Pre\\-Partido*\n\n"
-                f"Escaneados {len(markets_dict)} mercados\\.\n"
-                "No hay oportunidades destacadas ahora mismo\\.\n\n"
-                "Posibles razones:\n"
-                "• Todos los partidos ya empezaron \\(son LIVE\\)\n"
-                "• No hay cuotas atractivas \\(>2\\.5\\)\n"
-                "• Poca liquidez disponible\n\n"
-                "💡 Intenta de nuevo en 1\\-2 horas\\."
+                f"📊 *Análisis Pre\\-Partido*\n\n"
+                f"Escaneados `{len(prematch)}` mercados pre\\-partido\\.\n\n"
+                f"No hay oportunidades destacadas\\. Posibles razones:\n"
+                f"• Cuotas demasiado bajas \\(<2\\.0\\)\n"
+                f"• Poca liquidez disponible \\(<50 USDC\\)\n"
+                f"• Los partidos relevantes empiezan en >6h\n\n"
+                f"💡 Intenta de nuevo en 1\\-2 horas\\."
             )
         
-        # Top 5
         top = opps[:5]
         lines = [f"📊 *Análisis Pre\\-Partido* \\(Top {len(top)} de {len(opps)}\\)\n"]
         
@@ -810,15 +862,9 @@ def _get_analisis() -> str:
             medal = medals[i] if i < len(medals) else "•"
             evento = f"{opp['team1']} vs {opp['team2']}"
             sport_icon = {"Tennis": "🎾", "Basketball": "🏀", "Soccer": "⚽", "Baseball": "⚾"}.get(opp["sport"], "🏆")
-            
             hours = opp["hours_until"]
-            if hours < 1:
-                time_str = f"{int(hours * 60)}min"
-            else:
-                time_str = f"{hours:.1f}h"
-            
+            time_str = f"{int(hours * 60)}min" if hours < 1 else f"{hours:.1f}h"
             viable_icon = "✅" if opp["viable"] else "❌"
-            
             lines.append(
                 f"{medal} *{_escape(evento)}*  {sport_icon} {_escape(opp['league'])}\n"
                 f"   {_escape(opp['side'])} @ `{opp['odds']:.2f}` — Liquidez: `{opp['liquidity']:.0f}` USDC\n"
@@ -827,15 +873,6 @@ def _get_analisis() -> str:
                 f"\\(actual: `{opp['opp_odds']:.2f}` {viable_icon}\\)\n"
                 f"   {_escape(opp['recommendation'])} — Score: `{opp['score']:.0f}/100`\n"
             )
-        
-        # Mostrar rechazadas si hay
-        rejected = [o for o in opps if o["score"] < 50 or not o["viable"] or o["liquidity"] < 100][:3]
-        if rejected and len(top) < len(opps):
-            lines.append("\n⚠️ *EVITAR:*")
-            for opp in rejected:
-                evento = f"{opp['team1']} vs {opp['team2']}"
-                reason = opp['recommendation']
-                lines.append(f"❌ {_escape(evento)} — {_escape(reason)}")
         
         return "\n".join(lines)
         
@@ -940,9 +977,17 @@ def _format_surebet_alert(sb: dict, compact: bool = False, autobet_result: dict 
         if autobet_result.get("success"):
             actual_stake = autobet_result.get("stake", hedge)
             actual_odds  = autobet_result.get("odds", odd_opp)
-            autobet_line = (
-                f"\n🤖 *AutoBet EJECUTADO:* `{actual_stake:.2f}` USDC @ `{actual_odds:.3f}`"
-            )
+            order_type   = autobet_result.get("type", "taker")
+            if order_type == "limit":
+                mins = autobet_result.get("expiry", 0)
+                autobet_line = (
+                    f"\n📋 *AutoBet LIMIT publicado:* `{actual_stake:.2f}` USDC @ cuota taker ~`{actual_odds:.3f}`\n"
+                    f"   _Esperando que alguien llene la orden \\(activa 60 min\\)_"
+                )
+            else:
+                autobet_line = (
+                    f"\n🤖 *AutoBet EJECUTADO:* `{actual_stake:.2f}` USDC @ `{actual_odds:.3f}`"
+                )
         else:
             err = _escape(autobet_result.get("message", "Error desconocido"))
             autobet_line = f"\n🤖 *AutoBet FALLÓ:* {err}"

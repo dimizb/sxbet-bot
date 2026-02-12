@@ -136,32 +136,51 @@ class SXBetClient:
         Retorna {marketHash: marketData}.
         """
         try:
-            params = {}
+            params = {"onlyMainLine": "true"}
             if sport_ids:
                 params["sportId"] = ",".join(str(s) for s in sport_ids)
             
             body = self._get(f"{API_BASE}/markets/active", params=params)
-            if not body or body.get("status") != "success":
-                log.error(f"fetch_active_markets failed: {body}")
+            if not body:
+                log.error("fetch_active_markets: respuesta vacía o None")
+                return {}
+            
+            if body.get("status") != "success":
+                log.error(f"fetch_active_markets status: {body.get('status')} — {body}")
                 return {}
             
             data = body.get("data", [])
+            log.info(f"fetch_active_markets raw data type: {type(data).__name__}, len: {len(data) if hasattr(data, '__len__') else 'N/A'}")
             
-            # Puede venir como array o dict
+            # Puede venir como lista de dicts, o como lista de strings (hashes)
             result = {}
             if isinstance(data, list):
-                for m in data[:limit]:
+                for i, m in enumerate(data[:limit]):
                     if isinstance(m, dict) and "marketHash" in m:
                         result[m["marketHash"]] = m
+                    elif isinstance(m, str) and m.startswith("0x"):
+                        # Solo hash — necesitamos fetch_markets para los datos
+                        pass
+                    else:
+                        if i == 0:
+                            log.warning(f"Elemento inesperado en data[0]: type={type(m).__name__}, val={str(m)[:100]}")
+                
+                # Si solo recibimos hashes, buscar datos completos
+                if not result and data and isinstance(data[0], str):
+                    log.info(f"Solo recibimos hashes ({len(data)}), buscando datos completos...")
+                    hashes = [h for h in data[:limit] if isinstance(h, str)]
+                    result = self.fetch_markets(hashes)
+                    
             elif isinstance(data, dict):
-                # Ya es {marketHash: market}
-                result = dict(list(data.items())[:limit])
+                for k, v in list(data.items())[:limit]:
+                    if isinstance(v, dict):
+                        result[k] = v
             
-            log.info(f"fetch_active_markets: {len(result)} mercados")
+            log.info(f"fetch_active_markets: {len(result)} mercados parseados")
             return result
             
         except Exception as e:
-            log.error(f"fetch_active_markets error: {e}")
+            log.error(f"fetch_active_markets error: {e}", exc_info=True)
             return {}
 
     def fetch_markets(self, hashes: list) -> dict:
