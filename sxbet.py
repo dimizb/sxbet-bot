@@ -152,29 +152,49 @@ class SXBetClient:
             data = body.get("data", [])
             log.info(f"fetch_active_markets raw data type: {type(data).__name__}, len: {len(data) if hasattr(data, '__len__') else 'N/A'}")
             
-            # Puede venir como lista de dicts, o como lista de strings (hashes)
-            result = {}
+            # La API puede devolver:
+            # 1. Lista de markets: [{"marketHash": "0x...", ...}, ...]
+            # 2. Dict con "markets" y "nextKey": {"markets": [...], "nextKey": "..."}
+            # 3. Dict {marketHash: marketData}
+            raw_list = None
+            
             if isinstance(data, list):
-                for i, m in enumerate(data[:limit]):
-                    if isinstance(m, dict) and "marketHash" in m:
-                        result[m["marketHash"]] = m
-                    elif isinstance(m, str) and m.startswith("0x"):
-                        # Solo hash — necesitamos fetch_markets para los datos
-                        pass
-                    else:
-                        if i == 0:
-                            log.warning(f"Elemento inesperado en data[0]: type={type(m).__name__}, val={str(m)[:100]}")
-                
-                # Si solo recibimos hashes, buscar datos completos
-                if not result and data and isinstance(data[0], str):
-                    log.info(f"Solo recibimos hashes ({len(data)}), buscando datos completos...")
-                    hashes = [h for h in data[:limit] if isinstance(h, str)]
-                    result = self.fetch_markets(hashes)
-                    
+                raw_list = data
             elif isinstance(data, dict):
-                for k, v in list(data.items())[:limit]:
-                    if isinstance(v, dict):
-                        result[k] = v
+                # Buscar clave que contenga la lista de mercados
+                for key in ("markets", "data", "results", "items"):
+                    if key in data and isinstance(data[key], list):
+                        raw_list = data[key]
+                        log.info(f"Found markets in data['{key}']: {len(raw_list)} items")
+                        break
+                
+                if raw_list is None:
+                    # Puede ser {marketHash: marketData} directamente
+                    first_val = next(iter(data.values()), None)
+                    if isinstance(first_val, dict) and "marketHash" in first_val:
+                        log.info("data is already {marketHash: market} dict")
+                        return dict(list(data.items())[:limit])
+                    else:
+                        log.error(f"Unknown data dict structure. Keys: {list(data.keys())[:5]}")
+                        return {}
+            
+            if raw_list is None:
+                log.error(f"Could not find market list in response")
+                return {}
+            
+            result = {}
+            for m in raw_list[:limit]:
+                if isinstance(m, dict) and "marketHash" in m:
+                    result[m["marketHash"]] = m
+                elif isinstance(m, str) and m.startswith("0x"):
+                    # Solo hashes — buscar datos completos
+                    pass
+            
+            # Si solo recibimos hashes, buscar datos completos
+            if not result and raw_list and isinstance(raw_list[0], str):
+                log.info(f"Solo hashes ({len(raw_list)}), fetching full data...")
+                hashes = [h for h in raw_list[:limit] if isinstance(h, str)]
+                result = self.fetch_markets(hashes)
             
             log.info(f"fetch_active_markets: {len(result)} mercados parseados")
             return result

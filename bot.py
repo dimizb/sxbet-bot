@@ -759,6 +759,7 @@ def _get_activas() -> str:
                 )
             else:
                 rec_line = f"   📌 Cuota insuficiente para cubrir con ROI≥`{MIN_ROI:.0f}%`"
+            lines.append("")
             lines.append(
                 f"🔴 *{_escape(e['evento'])}*{e['score_str']}\n"
                 f"   {_escape(e['sport'])} — {_escape(e['league'])}\n"
@@ -786,8 +787,9 @@ def _get_activas() -> str:
                 )
             else:
                 rec_line = f"   📌 Cuota insuficiente para cubrir con ROI≥`{MIN_ROI:.0f}%`"
+            lines.append("")
             lines.append(
-                f"⏳ {_escape(e['evento'])}\n"
+                f"⏳ *{_escape(e['evento'])}*\n"
                 f"   {_escape(e['sport'])} — {_escape(e['league'])}\n"
                 f"   {_escape(e['side'])} @ `{g['avg_odds']:.3f}` — Stake: `{g['total_stake']:.2f}` USDC\n"
                 f"   Partido: `{_escape(fecha)} UTC`\n"
